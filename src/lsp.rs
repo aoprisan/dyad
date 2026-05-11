@@ -1,11 +1,11 @@
-//! Phase 6 — LSP client for `rust-analyzer`.
+//! Phase 6 — generic LSP client.
 //!
-//! Spawns rust-analyzer as a child process, speaks JSON-RPC 2.0 over
-//! its stdin/stdout with the standard LSP Content-Length framing,
-//! tracks publishDiagnostics into a cache, and answers
-//! `textDocument/definition`. Other tools (references, hover,
-//! completion) can be added without restructuring — see Phase 6 design
-//! choice in DESIGN.md.
+//! Spawns a language server (rust-analyzer, Metals, …) as a child
+//! process, speaks JSON-RPC 2.0 over its stdin/stdout with the standard
+//! LSP Content-Length framing, tracks publishDiagnostics into a cache,
+//! and answers `textDocument/{definition, hover, rename}`. The per-
+//! language details (binary name, languageId, init capabilities,
+//! workspace markers, install hint) come from [`crate::language::Language`].
 //!
 //! Threading model:
 //!   - Main thread holds the `LspClient` and writes requests over
@@ -15,9 +15,9 @@
 //!     forwards the result. For notifications it updates the shared
 //!     diagnostics cache.
 //!
-//! The client is fail-graceful: if rust-analyzer isn't on PATH or
-//! initialize times out, `spawn_rust` returns `Err` and the caller
-//! continues without LSP features (see `ProtocolState::open`).
+//! The client is fail-graceful: if the binary isn't on PATH or
+//! initialize times out, `spawn` returns `Err` and the caller continues
+//! without LSP features (see `ProtocolState::open`).
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -32,6 +32,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+use crate::language::Language;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
 pub struct Position {
@@ -86,10 +88,13 @@ struct LspState {
     /// `true` once rust-analyzer reports it has finished indexing
     /// (`experimental/serverStatus` with `quiescent: true`). Starts
     /// `false` — newly spawned servers are always still indexing.
+    /// Only servers whose `Language::supports_quiescent_status()` is
+    /// true ever flip this; for the rest `is_indexing()` short-circuits.
     quiescent: bool,
 }
 
 pub struct LspClient {
+    language: Language,
     state: Arc<Mutex<LspState>>,
     next_id: AtomicI64,
     /// Shared with the reader thread so server-initiated requests
@@ -105,29 +110,39 @@ pub struct LspClient {
 }
 
 impl LspClient {
-    /// Spawn rust-analyzer for `workspace_root`, run initialize, send
+    /// Spawn the language server for `language`, run initialize, send
     /// initialized, and didOpen the seed file. Returns the client once
-    /// the initialize response arrives — typically a few seconds on
-    /// first launch.
-    pub fn spawn_rust(
+    /// the initialize response arrives. Each language gets its own
+    /// stderr log at `/tmp/dyad-lsp-{lang}.log`.
+    pub fn spawn(
+        language: Language,
         workspace_root: &Path,
         file_uri: &str,
         initial_text: &str,
     ) -> Result<Self> {
-        // Route rust-analyzer's stderr to a log file. Truncated per
-        // spawn so the file contains exactly the current session, which
-        // is what `tail -f /tmp/dyad-lsp.log` from another terminal
-        // needs to surface init / workspace-load / panic output.
-        let log_file = std::fs::File::create("/tmp/dyad-lsp.log")
-            .context("opening /tmp/dyad-lsp.log for rust-analyzer stderr")?;
-        let mut child = Command::new("rust-analyzer")
+        let log_path = format!("/tmp/dyad-lsp-{}.log", language.display_name());
+        let log_file = std::fs::File::create(&log_path)
+            .with_context(|| format!("opening {log_path} for {} stderr", language.lsp_binary()))?;
+        let binary = language.lsp_binary();
+        let mut child = Command::new(binary)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(log_file))
             .spawn()
-            .context("spawning rust-analyzer (is `rustup component add rust-analyzer` done?)")?;
-        let stdin = child.stdin.take().context("rust-analyzer stdin unavailable")?;
-        let stdout = child.stdout.take().context("rust-analyzer stdout unavailable")?;
+            .with_context(|| {
+                format!(
+                    "spawning {binary} (try `{}`)",
+                    language.install_hint()
+                )
+            })?;
+        let stdin = child
+            .stdin
+            .take()
+            .with_context(|| format!("{binary} stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .with_context(|| format!("{binary} stdout unavailable"))?;
         let state = Arc::new(Mutex::new(LspState {
             pending: HashMap::new(),
             diagnostics: HashMap::new(),
@@ -138,6 +153,7 @@ impl LspClient {
         let reader_stdin = Arc::clone(&stdin);
         let reader = std::thread::spawn(move || reader_loop(stdout, reader_state, reader_stdin));
         let client = Self {
+            language,
             state,
             next_id: AtomicI64::new(1),
             stdin,
@@ -146,35 +162,47 @@ impl LspClient {
         };
         client.initialize(workspace_root)?;
         client.notify("initialized", json!({}))?;
-        client.did_open(file_uri, "rust", initial_text)?;
+        client.did_open(file_uri, language.lsp_language_id(), initial_text)?;
         Ok(client)
+    }
+
+    /// Which language this client was spawned for. Surfaced via
+    /// `is_indexing`, error messages, and per-language routing in
+    /// `App` / `ProtocolState`.
+    pub fn language(&self) -> Language {
+        self.language
     }
 
     fn initialize(&self, workspace_root: &Path) -> Result<()> {
         let root_uri = path_to_uri(workspace_root);
-        let params = json!({
+        let mut capabilities = json!({
+            "textDocument": {
+                "publishDiagnostics": { "relatedInformation": false },
+                "definition": { "linkSupport": false },
+                "hover": {},
+                "synchronization": {
+                    "didSave": false,
+                    "willSave": false,
+                    "willSaveWaitUntil": false,
+                },
+            },
+        });
+        if self.language.advertises_rust_analyzer_server_status() {
+            // rust-analyzer extension: emits `experimental/serverStatus`
+            // notifications with a `quiescent` flag once indexing is
+            // done. We use it to drive the LSP-alive badge state.
+            capabilities["experimental"] = json!({ "serverStatusNotification": true });
+        }
+        let mut params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
-            "capabilities": {
-                "textDocument": {
-                    "publishDiagnostics": { "relatedInformation": false },
-                    "definition": { "linkSupport": false },
-                    "hover": {},
-                    "synchronization": {
-                        "didSave": false,
-                        "willSave": false,
-                        "willSaveWaitUntil": false,
-                    },
-                },
-                // rust-analyzer extension: emits `experimental/serverStatus`
-                // notifications with a `quiescent` flag once indexing is
-                // done. We use it to drive the LSP-alive badge state.
-                "experimental": { "serverStatusNotification": true },
-            },
+            "capabilities": capabilities,
             "clientInfo": { "name": "dyad" },
         });
-        // rust-analyzer can take 10+ seconds on first launch — large.
-        self.request("initialize", params, Duration::from_secs(30))?;
+        if let Some(init_opts) = self.language.initialization_options() {
+            params["initializationOptions"] = init_opts;
+        }
+        self.request("initialize", params, self.language.initialize_timeout())?;
         Ok(())
     }
 
@@ -292,11 +320,16 @@ impl LspClient {
         }
     }
 
-    /// `true` while rust-analyzer is still loading the workspace and
+    /// `true` while the server is still loading the workspace and
     /// indexing — definition / hover / diagnostics requests can return
-    /// empty in this window. Flips to `false` on the first
-    /// `experimental/serverStatus` notification with `quiescent: true`.
+    /// empty in this window. For rust-analyzer this tracks
+    /// `experimental/serverStatus { quiescent }`; for Metals it
+    /// tracks `metals/status` text. Languages that don't track any
+    /// status notification report `false` immediately.
     pub fn is_indexing(&self) -> bool {
+        if !self.language.tracks_indexing_status() {
+            return false;
+        }
         !self.state.lock().unwrap().quiescent
     }
 
@@ -394,15 +427,26 @@ fn reader_loop(
 
         match (id, method) {
             // Server-initiated request: any message with both id and
-            // method. We don't actually serve any of these (config,
+            // method. We don't actually serve most of these (config,
             // capability registration, progress tokens, …) but the
             // server hangs if we don't reply, which blocks workspace
             // load and makes definition queries return empty.
-            (Some(id), Some(_)) => {
+            //
+            // `window/showMessageRequest` is special: Metals uses it to
+            // ask the user whether to import the build. Replying `null`
+            // would be read as "Not now" and Metals would never index
+            // anything. Auto-pick the affirmative action so first-open
+            // diagnostics actually flow.
+            (Some(id), Some(m)) => {
+                let result = if m == "window/showMessageRequest" {
+                    auto_pick_show_message_action(msg.get("params"))
+                } else {
+                    Value::Null
+                };
                 let reply = json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "result": Value::Null,
+                    "result": result,
                 });
                 let _ = write_message(&stdin, &reply);
             }
@@ -416,7 +460,7 @@ fn reader_loop(
                     }
                 }
             }
-            // Server notification (no id). We only consume the two we
+            // Server notification (no id). We only consume the ones we
             // care about; window/logMessage and `$/progress` are dropped.
             (None, Some(method)) => match method {
                 "textDocument/publishDiagnostics" => {
@@ -425,8 +469,15 @@ fn reader_loop(
                     }
                 }
                 "experimental/serverStatus" => {
+                    // rust-analyzer extension.
                     if let Some(params) = msg.get("params") {
                         update_quiescent(&state, params);
+                    }
+                }
+                "metals/status" => {
+                    // Metals extension — same idea, different schema.
+                    if let Some(params) = msg.get("params") {
+                        update_metals_status(&state, params);
                     }
                 }
                 _ => {}
@@ -466,6 +517,51 @@ fn update_quiescent(state: &Arc<Mutex<LspState>>, params: &Value) {
         return;
     };
     state.lock().unwrap().quiescent = q;
+}
+
+/// Handle a Metals `metals/status` notification. Metals broadcasts its
+/// indexing / build-import / compilation phases through this — the
+/// `text` field carries a human-readable label like "Compiling foo" or
+/// "Indexing"; `hide: true` (or empty text) means idle.
+///
+/// Heuristic: any `text` starting with a known busy verb leaves the
+/// server marked as still indexing; anything else (including the bare
+/// brand name "Metals") flips it to quiescent. Conservative on the busy
+/// side — better to delay a definition lookup than to silently return
+/// empty.
+fn update_metals_status(state: &Arc<Mutex<LspState>>, params: &Value) {
+    let hide = params.get("hide").and_then(Value::as_bool).unwrap_or(false);
+    let text = params.get("text").and_then(Value::as_str).unwrap_or("");
+    let busy = !hide
+        && ["Indexing", "Compiling", "Importing", "Building", "Loading"]
+            .iter()
+            .any(|prefix| text.contains(prefix));
+    state.lock().unwrap().quiescent = !busy;
+}
+
+/// Pick a response for `window/showMessageRequest`. Metals fires this on
+/// first open ("Import build?", "Reset build?", …); auto-replying `null`
+/// makes the user effectively answer "no", which leaves Metals idle.
+/// Prefer a build-import action if present; otherwise pick the first
+/// offered action so we never silently decline.
+fn auto_pick_show_message_action(params: Option<&Value>) -> Value {
+    let Some(params) = params else { return Value::Null };
+    let Some(actions) = params.get("actions").and_then(Value::as_array) else {
+        return Value::Null;
+    };
+    if actions.is_empty() {
+        return Value::Null;
+    }
+    actions
+        .iter()
+        .find(|a| {
+            a.get("title")
+                .and_then(Value::as_str)
+                .map(|t| t.eq_ignore_ascii_case("Import build"))
+                .unwrap_or(false)
+        })
+        .unwrap_or(&actions[0])
+        .clone()
 }
 
 fn read_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>> {
@@ -530,21 +626,28 @@ pub fn path_to_uri(path: &Path) -> String {
 }
 
 /// Walk upward from `path` looking for the nearest directory that
-/// contains a `Cargo.toml`. Falls back to `path`'s parent if none is
-/// found — rust-analyzer copes either way, just with less context.
+/// contains any of the language's workspace markers (e.g. `Cargo.toml`
+/// for Rust, `build.sbt` / `build.sc` for Scala). Falls back to
+/// `path`'s parent if none is found — language servers cope either
+/// way, just with less context.
 ///
 /// Absolutizes `path` up-front: with a relative input like `src/main.rs`
 /// the loop would otherwise terminate at an empty `PathBuf`, and a
 /// downstream `file://` URI on that empty path makes rust-analyzer log
 /// `failed to find any projects in [AbsPathBuf("/")]`.
-pub fn workspace_root_for(path: &Path) -> PathBuf {
+///
+/// Per-language markers keep polyglot repos honest: looking up Scala
+/// markers from a `.scala` file walks past any `Cargo.toml` higher up
+/// without grabbing it.
+pub fn workspace_root_for(path: &Path, language: Language) -> PathBuf {
     let abs = absolutize(path);
     let mut cur = abs
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"));
+    let markers = language.workspace_markers();
     loop {
-        if cur.join("Cargo.toml").exists() {
+        if markers.iter().any(|m| cur.join(m).exists()) {
             return cur;
         }
         match cur.parent() {
@@ -659,7 +762,30 @@ mod tests {
         // The dyad project itself has Cargo.toml at its root.
         let here = std::env::current_dir().unwrap();
         let nested = here.join("src/main.rs");
-        let root = workspace_root_for(&nested);
+        let root = workspace_root_for(&nested, Language::Rust);
         assert!(root.join("Cargo.toml").exists(), "found {root:?}");
+    }
+
+    #[test]
+    fn workspace_root_walks_up_to_build_sbt() {
+        // Scratch directory: <tmp>/dyad-ws-<pid>/scala/src/Main.scala
+        // with build.sbt at <tmp>/dyad-ws-<pid>/scala/.
+        let base = std::env::temp_dir().join(format!("dyad-ws-{}", std::process::id()));
+        let scala_root = base.join("scala");
+        let src_dir = scala_root.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(scala_root.join("build.sbt"), "").unwrap();
+        let nested = src_dir.join("Main.scala");
+        std::fs::write(&nested, "").unwrap();
+
+        let root = workspace_root_for(&nested, Language::Scala);
+        // canonicalize both sides so symlinked tmpdirs (macOS /tmp ->
+        // /private/tmp) don't trip the comparison.
+        assert_eq!(
+            root.canonicalize().unwrap(),
+            scala_root.canonicalize().unwrap()
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

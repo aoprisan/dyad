@@ -247,7 +247,7 @@ fn tools_list_result() -> Value {
                     "limit": {"type": "integer", "minimum": 0},
                 },
             })),
-            tool_def("symbol.definition", "Find the LSP definition location for a symbol at the given zero-based line/character. Requires rust-analyzer.", json!({
+            tool_def("symbol.definition", "Find the LSP definition location for a symbol at the given zero-based line/character. Requires a running language server (rust-analyzer for .rs, metals for .scala/.sc/.sbt).", json!({
                 "type": "object",
                 "required": ["buffer_id", "line", "character"],
                 "properties": {
@@ -256,14 +256,14 @@ fn tools_list_result() -> Value {
                     "character": {"type": "integer", "minimum": 0},
                 },
             })),
-            tool_def("diag.current", "Return cached LSP diagnostics for a buffer (severity 1=error..4=hint). Requires rust-analyzer.", json!({
+            tool_def("diag.current", "Return cached LSP diagnostics for a buffer (severity 1=error..4=hint). Requires a running language server (rust-analyzer for .rs, metals for .scala/.sc/.sbt).", json!({
                 "type": "object",
                 "required": ["buffer_id"],
                 "properties": {
                     "buffer_id": {"type": "integer"},
                 },
             })),
-            tool_def("edit.rename_symbol", "Rename the symbol at (line, character) to new_name. Applies in-buffer edits as one transaction; cross-file changes come back in skipped_files. Requires rust-analyzer.", json!({
+            tool_def("edit.rename_symbol", "Rename the symbol at (line, character) to new_name. Applies in-buffer edits as one transaction; cross-file changes come back in skipped_files. Requires a running language server (rust-analyzer for .rs, metals for .scala/.sc/.sbt).", json!({
                 "type": "object",
                 "required": ["buffer_id", "version", "line", "character", "new_name"],
                 "properties": {

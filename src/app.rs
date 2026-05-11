@@ -10,6 +10,7 @@ use crate::action::Action;
 use crate::buffer::Buffer;
 use crate::git::{self, LineStatus};
 use crate::input;
+use crate::language::Language;
 use crate::lsp::{self, LspClient};
 use crate::syntax::Syntax;
 use crate::protocol;
@@ -28,15 +29,20 @@ pub struct App {
     /// working-tree file. Refreshed on save and at startup; empty when
     /// the file isn't in a git repo (or git isn't installed).
     pub git_status: HashMap<usize, LineStatus>,
-    /// `rust-analyzer` client when the seed file is Rust and the binary
-    /// is on PATH. `None` everywhere else (including non-Rust files and
-    /// failed spawns) — every consumer must tolerate absence.
-    pub lsp: Option<LspClient>,
+    /// LSP clients keyed by language. The first buffer in a supported
+    /// language lazy-spawns its server; subsequent buffers in the same
+    /// language reuse the client. Empty until a supported file opens.
+    pub lsp_clients: HashMap<Language, LspClient>,
+    /// Cached language of the focused buffer. Drives which entry in
+    /// `lsp_clients` receives `didChange` and which server backs hover /
+    /// goto-def / rename requests.
+    pub language: Option<Language>,
     pub lsp_uri: Option<String>,
-    /// True when LSP spawn was attempted (i.e., the file looked like Rust),
-    /// regardless of outcome. Combined with `lsp.is_some()` this lets the
-    /// UI render an Active / Failed / Hidden indicator without re-checking
-    /// the file extension.
+    /// True when LSP spawn was attempted for the focused buffer (i.e.,
+    /// the file was in a supported language), regardless of outcome.
+    /// Combined with `active_lsp().is_some()` this lets the UI render
+    /// an Active / Failed / Hidden indicator without re-checking the
+    /// file extension.
     pub lsp_attempted: bool,
     lsp_version: i32,
     /// Locations we navigated *from* via cross-file go-to-definition.
@@ -185,7 +191,8 @@ impl App {
             syn.refresh(&mut buffer);
         }
         let git_status = compute_git_status(buffer.path());
-        let (lsp, lsp_uri, lsp_attempted) = spawn_lsp(&buffer);
+        let language = buffer.path().and_then(Language::for_path);
+        let (lsp_clients, lsp_uri, lsp_attempted) = spawn_lsp(&buffer);
         let tree_root = buffer
             .path()
             .and_then(|p| p.parent())
@@ -198,7 +205,8 @@ impl App {
             running: true,
             status: String::new(),
             git_status,
-            lsp,
+            lsp_clients,
+            language,
             lsp_uri,
             lsp_attempted,
             lsp_version: 0,
@@ -228,7 +236,8 @@ impl App {
             running: true,
             status: String::new(),
             git_status: HashMap::new(),
-            lsp: None,
+            lsp_clients: HashMap::new(),
+            language: None,
             lsp_uri: None,
             lsp_attempted: false,
             lsp_version: 0,
@@ -524,19 +533,27 @@ impl App {
         Ok(())
     }
 
+    /// LSP client for the currently-focused buffer, if any.
+    pub fn active_lsp(&self) -> Option<&LspClient> {
+        self.language.and_then(|lang| self.lsp_clients.get(&lang))
+    }
+
     fn notify_lsp_changed(&mut self) {
-        let Some(lsp) = self.lsp.as_ref() else { return };
-        let Some(uri) = self.lsp_uri.as_ref() else { return };
+        let Some(lang) = self.language else { return };
+        let Some(uri) = self.lsp_uri.clone() else { return };
         self.lsp_version += 1;
+        let version = self.lsp_version;
         let text = self.buffer.rope().to_string();
-        let _ = lsp.did_change(uri, self.lsp_version, &text);
+        if let Some(lsp) = self.lsp_clients.get(&lang) {
+            let _ = lsp.did_change(&uri, version, &text);
+        }
     }
 
     /// Resolve `textDocument/definition` at the cursor. Returns the
     /// status-bar message — empty string means "moved cursor, no
     /// message needed."
     fn go_to_definition(&mut self) -> String {
-        let (Some(lsp), Some(uri)) = (self.lsp.as_ref(), self.lsp_uri.as_ref()) else {
+        let (Some(lsp), Some(uri)) = (self.active_lsp(), self.lsp_uri.as_ref()) else {
             return "LSP not available".into();
         };
         let line = self.view.cursor_line() as u32;
@@ -544,8 +561,8 @@ impl App {
         let result = lsp.definition(uri, line, character);
         match result {
             Ok(locs) if locs.is_empty() => {
-                if self.lsp.as_ref().map(|c| c.is_indexing()).unwrap_or(false) {
-                    "rust-analyzer still indexing — try again in a moment".into()
+                if lsp.is_indexing() {
+                    format!("{} still indexing — try again in a moment", lsp.language().lsp_binary())
                 } else {
                     "No definition found".into()
                 }
@@ -803,17 +820,24 @@ impl App {
     /// extracting `: Type` from the source line so the user gets
     /// `Option<…>` instead of `dyad::app::App`.
     fn show_type(&mut self) {
-        let (Some(lsp), Some(uri)) = (self.lsp.as_ref(), self.lsp_uri.as_ref()) else {
+        let (Some(lsp), Some(uri)) = (self.active_lsp(), self.lsp_uri.as_ref()) else {
             self.status = "LSP not available".into();
             return;
         };
         let line_idx = self.view.cursor_line();
         let line = line_idx as u32;
         let character = self.view.cursor_col() as u32;
+        // The source-line `: Type` fallback is a Rust-specific heuristic
+        // (`looks_like_path_only` keys on `::`-separated paths); only
+        // engage it when the active language opts in.
+        let source_fallback_ok = self
+            .language
+            .map(Language::supports_type_from_source_line)
+            .unwrap_or(false);
         match lsp.hover(uri, line, character) {
             Ok(Some(text)) => match extract_signature(&text) {
                 Some(sig) => {
-                    let resolved = if looks_like_path_only(&sig) {
+                    let resolved = if source_fallback_ok && looks_like_path_only(&sig) {
                         type_from_source_line(&self.buffer, line_idx).unwrap_or(sig)
                     } else {
                         sig
@@ -824,7 +848,7 @@ impl App {
             },
             Ok(None) => {
                 self.status = if lsp.is_indexing() {
-                    "rust-analyzer still indexing — try again in a moment".into()
+                    format!("{} still indexing — try again in a moment", lsp.language().lsp_binary())
                 } else {
                     "No type info".into()
                 };
@@ -838,7 +862,7 @@ impl App {
     /// the prompt so a stray Up/Down inside the prompt buffer doesn't
     /// repoint the rename request.
     fn start_rename_prompt(&mut self) {
-        if self.lsp.is_none() {
+        if self.active_lsp().is_none() {
             self.status = "LSP not available".into();
             return;
         }
@@ -858,7 +882,7 @@ impl App {
             self.status = "Empty name — rename aborted".into();
             return Ok(());
         }
-        let (Some(lsp), Some(uri)) = (self.lsp.as_ref(), self.lsp_uri.as_ref()) else {
+        let (Some(lsp), Some(uri)) = (self.active_lsp(), self.lsp_uri.as_ref()) else {
             self.status = "LSP not available".into();
             return Ok(());
         };
@@ -1344,8 +1368,8 @@ impl App {
 
     /// Swap the current buffer for one rooted at `path`. Resets the view,
     /// re-runs the tree-sitter parse, refreshes git status, and tells the
-    /// existing LSP client about the new file. The LSP client itself is
-    /// not respawned — rust-analyzer already knows the workspace.
+    /// matching LSP client about the new file. Each language's server is
+    /// spawned at most once per session and reused across buffers.
     fn open_file(&mut self, path: &Path) -> Result<()> {
         let mut new_buffer = Buffer::open(path.to_path_buf())?;
         let mut new_syntax = Syntax::for_path(new_buffer.path());
@@ -1354,39 +1378,27 @@ impl App {
         }
         let new_git_status = compute_git_status(new_buffer.path());
         let new_uri = new_buffer.path().map(lsp::path_to_uri);
-        let is_rust = new_buffer
-            .path()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            == Some("rs");
+        let new_language = new_buffer.path().and_then(Language::for_path);
 
-        // rust-analyzer is a single workspace-wide instance. Two paths:
-        //   - if it's already running, send didOpen so it picks up the
-        //     new doc (it tolerates didOpen on a known doc — replaces
-        //     its view);
-        //   - if it isn't, this is the first Rust file we've seen, so
-        //     lazy-spawn it. This is what makes `dyad <dir>` followed
-        //     by picking a `.rs` file from the tree behave the same as
-        //     `dyad <file.rs>` from the command line.
-        if self.lsp.is_none() && is_rust {
-            let (lsp, _spawned_uri, attempted) = spawn_lsp(&new_buffer);
-            self.lsp = lsp;
-            self.lsp_attempted = attempted;
-            // spawn_rust already issued didOpen with the file's content;
-            // the else-branch's didOpen call would be redundant.
-        } else if let (Some(lsp), Some(uri), Some(p)) = (
-            self.lsp.as_ref(),
-            new_uri.as_ref(),
-            new_buffer.path(),
-        ) && p.extension().and_then(|e| e.to_str()) == Some("rs")
+        if let Some(lang) = new_language
+            && !self.lsp_clients.contains_key(&lang)
         {
-            let _ = lsp.did_open(uri, "rust", &new_buffer.rope().to_string());
+            let (clients, _spawned_uri, attempted) = spawn_lsp(&new_buffer);
+            self.lsp_clients.extend(clients);
+            self.lsp_attempted = attempted;
+            // spawn already issued didOpen with the file's content;
+            // the else-branch's didOpen call would be redundant.
+        } else if let (Some(lang), Some(uri)) = (new_language, new_uri.as_ref())
+            && let Some(lsp) = self.lsp_clients.get(&lang)
+        {
+            let _ = lsp.did_open(uri, lang.lsp_language_id(), &new_buffer.rope().to_string());
         }
 
         self.buffer = new_buffer;
         self.syntax = new_syntax;
         self.git_status = new_git_status;
         self.lsp_uri = new_uri;
+        self.language = new_language;
         self.lsp_version = 0;
         self.view = View::new();
         // Keep the tree's cursor in sync with whatever file is now
@@ -1639,22 +1651,30 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     uri.strip_prefix("file://").map(PathBuf::from)
 }
 
-/// Returns `(client, uri, attempted)`. `attempted` is `true` whenever
-/// the file looked like Rust, so the UI can distinguish "spawn failed"
-/// (red badge) from "we didn't try" (no badge).
-fn spawn_lsp(buffer: &Buffer) -> (Option<LspClient>, Option<String>, bool) {
+/// Returns `(clients, uri, attempted)`. `attempted` is `true` whenever
+/// the file was in a language we know how to spawn an LSP for, so the
+/// UI can distinguish "spawn failed" (red badge) from "we didn't try"
+/// (no badge). The map is empty unless spawn succeeded.
+///
+/// Step 3 still gates spawning to `Language::Rust` only — step 5 lifts
+/// this so Metals fires for `.scala` files too.
+fn spawn_lsp(buffer: &Buffer) -> (HashMap<Language, LspClient>, Option<String>, bool) {
+    let mut clients = HashMap::new();
     let Some(path) = buffer.path() else {
-        return (None, None, false);
+        return (clients, None, false);
     };
-    if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-        return (None, None, false);
-    }
+    let Some(language) = Language::for_path(path) else {
+        return (clients, None, false);
+    };
     let uri = lsp::path_to_uri(path);
-    let workspace = lsp::workspace_root_for(path);
-    match LspClient::spawn_rust(&workspace, &uri, &buffer.rope().to_string()) {
-        Ok(client) => (Some(client), Some(uri), true),
+    let workspace = lsp::workspace_root_for(path, language);
+    match LspClient::spawn(language, &workspace, &uri, &buffer.rope().to_string()) {
+        Ok(client) => {
+            clients.insert(language, client);
+            (clients, Some(uri), true)
+        }
         // Fail-graceful: the TUI runs without LSP-backed features.
-        Err(_) => (None, None, true),
+        Err(_) => (clients, None, true),
     }
 }
 

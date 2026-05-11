@@ -654,14 +654,14 @@ fn lsp_badge_span(app: &App) -> Option<Span<'static>> {
     if !app.lsp_attempted {
         return None;
     }
-    let (text, fg) = match app.lsp.as_ref() {
+    let (text, fg) = match app.active_lsp() {
         Some(client) if client.is_indexing() => {
-            // Yellow while rust-analyzer is loading the workspace.
+            // Yellow while the server is loading the workspace.
             // Definition/diagnostic requests return empty in this window.
             ("lsp… ", theme::warn())
         }
         Some(_) => ("lsp ", theme::ok()),
-        // Tried and failed — most often rust-analyzer not on PATH.
+        // Tried and failed — most often the server binary isn't on PATH.
         None => ("lsp! ", theme::error()),
     };
     Some(Span::styled(text, theme::status_bar().fg(fg)))
@@ -684,7 +684,7 @@ const HISTORY_HINT_TEXT: &str =
 /// First LSP diagnostic that starts on the cursor line, formatted for
 /// the status bar. Returns `(text, severity)` so the caller can colorize.
 fn current_line_diagnostic(app: &App) -> Option<(String, Option<u8>)> {
-    let lsp = app.lsp.as_ref()?;
+    let lsp = app.active_lsp()?;
     let uri = app.lsp_uri.as_ref()?;
     let cursor_line = app.view.cursor_line() as u32;
     let diag = lsp

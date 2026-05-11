@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::buffer::Buffer;
 use crate::git;
+use crate::language::Language;
 use crate::lsp::{self, Diagnostic, Location, LspClient, TextEdit};
 use crate::proposals::{PendingProposal, Proposal, ProposalId, ProposalKind, ProposalQueue};
 use crate::syntax::{AstMatch, Syntax};
@@ -41,11 +42,16 @@ pub struct ProtocolState {
     /// At most one explicit transaction at a time; the buffer it
     /// targets is recorded so per-buffer edits know whether to auto-tx.
     explicit_tx: Option<(TxId, u64)>,
-    /// Shared rust-analyzer connection. The first .rs buffer opened
-    /// spawns it; subsequent .rs buffers in the same workspace reuse
-    /// it via additional `didOpen` notifications.
-    lsp: Option<LspClient>,
-    workspace_root: Option<PathBuf>,
+    /// One LSP client per language. The first buffer opened in a
+    /// supported language spawns it lazily; subsequent buffers in the
+    /// same language reuse the client via additional `didOpen`
+    /// notifications. Polyglot sessions can host rust-analyzer and
+    /// Metals side-by-side.
+    lsp_clients: HashMap<Language, LspClient>,
+    /// Workspace root resolved at spawn time, kept per language so the
+    /// same dyad session can host (e.g.) a Rust workspace at `repo/`
+    /// and a Scala workspace at `repo/scala/`.
+    workspace_roots: HashMap<Language, PathBuf>,
     /// Stable identifier for this client (the current MCP session).
     /// Surfaced via `clients.list`.
     client_id: String,
@@ -58,6 +64,9 @@ struct BufferEntry {
     buffer: Buffer,
     syntax: Option<Syntax>,
     uri: Option<String>,
+    /// Cached at open time — used to route LSP traffic to the right
+    /// client. `None` for scratch buffers and unrecognized extensions.
+    language: Option<Language>,
     /// Per-buffer monotonic LSP document version (LSP needs an i32
     /// starting at 0 and incrementing on each `didChange`).
     lsp_version: i32,
@@ -125,8 +134,8 @@ impl ProtocolState {
             focus: None,
             tx_manager: TxManager::new(),
             explicit_tx: None,
-            lsp: None,
-            workspace_root: None,
+            lsp_clients: HashMap::new(),
+            workspace_roots: HashMap::new(),
             client_id: format!("mcp-{}", std::process::id()),
             proposals: ProposalQueue::new(),
         };
@@ -150,11 +159,10 @@ impl ProtocolState {
             syn.refresh(&mut buffer);
         }
         let uri = buffer.path().map(lsp::path_to_uri);
+        let language = buffer.path().and_then(Language::for_path);
 
-        if let (Some(p), Some(u)) = (buffer.path(), uri.as_ref())
-            && p.extension().and_then(|e| e.to_str()) == Some("rs")
-        {
-            self.ensure_lsp_or_open(p, u, &buffer.rope().to_string());
+        if let (Some(p), Some(u), Some(lang)) = (buffer.path(), uri.as_ref(), language) {
+            self.ensure_lsp_for(lang, p, u, &buffer.rope().to_string());
         }
 
         self.buffers.insert(
@@ -164,6 +172,7 @@ impl ProtocolState {
                 buffer,
                 syntax,
                 uri,
+                language,
                 lsp_version: 0,
             },
         );
@@ -179,7 +188,9 @@ impl ProtocolState {
             .buffers
             .remove(&buffer_id)
             .ok_or_else(|| anyhow!("unknown buffer_id {}", buffer_id))?;
-        if let (Some(lsp), Some(uri)) = (self.lsp.as_ref(), entry.uri.as_ref()) {
+        if let (Some(lang), Some(uri)) = (entry.language, entry.uri.as_ref())
+            && let Some(lsp) = self.lsp_clients.get(&lang)
+        {
             let _ = lsp.did_close(uri);
         }
         if self.focus == Some(buffer_id) {
@@ -393,28 +404,12 @@ impl ProtocolState {
         line: u32,
         character: u32,
     ) -> Result<Vec<Location>> {
-        let entry = self.buffer_entry(buffer_id)?;
-        let lsp = self
-            .lsp
-            .as_ref()
-            .context("rust-analyzer not running (see `rustup component add rust-analyzer`)")?;
-        let uri = entry
-            .uri
-            .as_ref()
-            .context("buffer has no file URI; cannot query LSP")?;
+        let (lsp, uri) = self.lsp_for_buffer(buffer_id)?;
         lsp.definition(uri, line, character)
     }
 
     pub fn diag_current(&self, buffer_id: u64) -> Result<Vec<Diagnostic>> {
-        let entry = self.buffer_entry(buffer_id)?;
-        let lsp = self
-            .lsp
-            .as_ref()
-            .context("rust-analyzer not running (see `rustup component add rust-analyzer`)")?;
-        let uri = entry
-            .uri
-            .as_ref()
-            .context("buffer has no file URI; cannot query LSP")?;
+        let (lsp, uri) = self.lsp_for_buffer(buffer_id)?;
         Ok(lsp.diagnostics(uri))
     }
 
@@ -438,15 +433,8 @@ impl ProtocolState {
         new_name: String,
     ) -> Result<RenameResult> {
         self.check_version(buffer_id, version)?;
-        let request_uri = self
-            .buffer_entry(buffer_id)?
-            .uri
-            .clone()
-            .context("buffer has no file URI; cannot query LSP")?;
-        let lsp = self
-            .lsp
-            .as_ref()
-            .context("rust-analyzer not running (see `rustup component add rust-analyzer`)")?;
+        let (lsp, request_uri) = self.lsp_for_buffer(buffer_id)?;
+        let request_uri = request_uri.to_string();
         let workspace_edit = lsp.rename(&request_uri, line, character, &new_name)?;
 
         let uri_to_bid: HashMap<String, u64> = self
@@ -723,10 +711,13 @@ impl ProtocolState {
     }
 
     fn notify_lsp_changed(&mut self, buffer_id: u64) {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(entry) = self.buffers.get_mut(&buffer_id) else {
             return;
         };
-        let Some(entry) = self.buffers.get_mut(&buffer_id) else {
+        let Some(lang) = entry.language else {
+            return;
+        };
+        let Some(lsp) = self.lsp_clients.get(&lang) else {
             return;
         };
         let Some(uri) = entry.uri.as_ref() else {
@@ -737,22 +728,44 @@ impl ProtocolState {
         let _ = lsp.did_change(uri, entry.lsp_version, &text);
     }
 
-    fn ensure_lsp_or_open(&mut self, path: &Path, uri: &str, text: &str) {
-        if let Some(lsp) = self.lsp.as_ref() {
+    fn ensure_lsp_for(&mut self, language: Language, path: &Path, uri: &str, text: &str) {
+        if let Some(lsp) = self.lsp_clients.get(&language) {
             // Already spawned — just register the new file.
-            let _ = lsp.did_open(uri, "rust", text);
+            let _ = lsp.did_open(uri, language.lsp_language_id(), text);
             return;
         }
-        let workspace = lsp::workspace_root_for(path);
-        match LspClient::spawn_rust(&workspace, uri, text) {
+        let workspace = lsp::workspace_root_for(path, language);
+        match LspClient::spawn(language, &workspace, uri, text) {
             Ok(client) => {
-                self.lsp = Some(client);
-                self.workspace_root = Some(workspace);
+                self.lsp_clients.insert(language, client);
+                self.workspace_roots.insert(language, workspace);
             }
             Err(e) => {
-                eprintln!("dyad: LSP disabled ({e})");
+                eprintln!("dyad: {} LSP disabled ({e})", language.display_name());
             }
         }
+    }
+
+    /// Look up the LSP client for `buffer_id`, returning the client +
+    /// the buffer's URI. The error message names the language's binary
+    /// and install hint so it stays accurate as we add more languages.
+    fn lsp_for_buffer(&self, buffer_id: u64) -> Result<(&LspClient, &str)> {
+        let entry = self.buffer_entry(buffer_id)?;
+        let lang = entry
+            .language
+            .context("buffer has no recognized language; cannot query LSP")?;
+        let uri = entry
+            .uri
+            .as_deref()
+            .context("buffer has no file URI; cannot query LSP")?;
+        let lsp = self.lsp_clients.get(&lang).with_context(|| {
+            format!(
+                "{} not running (see `{}`)",
+                lang.lsp_binary(),
+                lang.install_hint()
+            )
+        })?;
+        Ok((lsp, uri))
     }
 }
 

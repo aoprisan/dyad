@@ -16,9 +16,12 @@ use anyhow::{Context, Result};
 use ratatui::style::Style;
 use ropey::Rope;
 use serde::Serialize;
-use tree_sitter::{InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree};
+use tree_sitter::{
+    InputEdit, Language as TsLanguage, Parser, Point, Query, QueryCursor, StreamingIterator, Tree,
+};
 
 use crate::buffer::{Buffer, Edit};
+use crate::language::Language;
 
 /// Highlight names we know how to style. `build_capture_map` matches each
 /// query capture name to its longest prefix in this list, and the resulting
@@ -73,7 +76,7 @@ pub struct AstMatch {
 pub struct Syntax {
     parser: Parser,
     tree: Option<Tree>,
-    language: Language,
+    language: TsLanguage,
     highlight_query: Query,
     /// Maps `highlight_query.capture_names()[i]` to its `HIGHLIGHT_NAMES`
     /// index, or `None` when the capture (e.g. a predicate parameter) is
@@ -87,21 +90,32 @@ impl Syntax {
     /// Pick a syntax based on the file extension. Returns `None` for files
     /// we don't have a grammar for; the renderer falls back to plain text.
     pub fn for_path(path: Option<&Path>) -> Option<Self> {
-        let ext = path?.extension()?.to_str()?;
-        match ext {
-            "rs" => Self::rust().ok(),
-            _ => None,
+        match Language::for_path(path?)? {
+            Language::Rust => Self::rust().ok(),
+            Language::Scala => Self::scala().ok(),
         }
     }
 
     fn rust() -> Result<Self> {
-        let language: Language = tree_sitter_rust::LANGUAGE.into();
+        let language: TsLanguage = tree_sitter_rust::LANGUAGE.into();
+        Self::build(language, tree_sitter_rust::HIGHLIGHTS_QUERY, "rust")
+    }
+
+    fn scala() -> Result<Self> {
+        let language: TsLanguage = tree_sitter_scala::LANGUAGE.into();
+        Self::build(language, tree_sitter_scala::HIGHLIGHTS_QUERY, "scala")
+    }
+
+    /// Shared constructor — every grammar uses the same `HIGHLIGHT_NAMES`
+    /// canonical set and parser setup; only the grammar handle and the
+    /// highlights query differ.
+    fn build(language: TsLanguage, highlights_query: &str, name: &str) -> Result<Self> {
         let mut parser = Parser::new();
         parser
             .set_language(&language)
-            .context("loading rust grammar into parser")?;
-        let highlight_query = Query::new(&language, tree_sitter_rust::HIGHLIGHTS_QUERY)
-            .context("compiling rust highlights query")?;
+            .with_context(|| format!("loading {name} grammar into parser"))?;
+        let highlight_query = Query::new(&language, highlights_query)
+            .with_context(|| format!("compiling {name} highlights query"))?;
         let capture_map = build_capture_map(&highlight_query, HIGHLIGHT_NAMES);
         Ok(Self {
             parser,
@@ -437,6 +451,51 @@ mod tests {
             .find(|s| s.col_start == 3 && s.col_end == 8)
             .expect("`hello` function-name span");
         assert_eq!(name_span.capture_idx, function_idx);
+    }
+
+    fn scratch_scala_buffer(name: &str) -> Buffer {
+        let path = std::env::temp_dir()
+            .join(format!("dyad_test_{}_{}.scala", name, std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Buffer::open(path).unwrap()
+    }
+
+    #[test]
+    fn scala_ast_query_finds_method_names() {
+        let mut buf = scratch_scala_buffer("ast_query");
+        buf.insert_str(
+            0,
+            "object M {\n  def hello(): Unit = {}\n  def world(): Unit = {}\n}\n",
+        );
+        let mut syn = Syntax::scala().unwrap();
+        syn.refresh(&mut buf);
+        // `function_definition` is tree-sitter-scala's node for `def`.
+        let matches = syn
+            .ast_query(buf.rope(), "(function_definition name: (identifier) @name)")
+            .unwrap();
+        let names: Vec<String> = matches
+            .into_iter()
+            .filter(|m| m.capture == "name")
+            .map(|m| slice(buf.rope(), m.byte_start, m.byte_end))
+            .collect();
+        assert_eq!(names, vec!["hello".to_string(), "world".to_string()]);
+    }
+
+    /// Smoke check: highlighting runs against the Scala grammar without
+    /// blowing up and produces at least one keyword span. The exact
+    /// capture mapping (e.g. `def` -> keyword) depends on the grammar's
+    /// `highlights.scm`, which we treat as an upstream contract.
+    #[test]
+    fn scala_highlight_produces_spans() {
+        let mut buf = scratch_scala_buffer("highlight");
+        buf.insert_str(0, "object M { def hello: Int = 1 }\n");
+        let mut syn = Syntax::scala().unwrap();
+        syn.refresh(&mut buf);
+        let line0 = syn.line_spans(0);
+        assert!(
+            !line0.is_empty(),
+            "expected at least one highlight span on the Scala source line"
+        );
     }
 
     /// After an incremental edit, ast_query should still see the new state.
