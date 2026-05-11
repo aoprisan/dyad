@@ -160,6 +160,47 @@ numbers — survives reformatting.
 
 Steps 1–4 are a few weekends. Step 5 is when it becomes genuinely novel.
 
+## Dogfooding (Phase 5)
+
+The Phase 4 MCP server is line-delimited JSON-RPC 2.0 over stdio. To
+have a Claude Code session drive `dyad`, register it as a project-local
+MCP server:
+
+```jsonc
+// .mcp.json (project root) or ~/.claude/mcp_settings.json (global)
+{
+  "mcpServers": {
+    "dyad": {
+      "command": "/absolute/path/to/dyad/target/release/dyad",
+      "args": ["--mcp", "/absolute/path/to/the/file/to/edit.rs"]
+    }
+  }
+}
+```
+
+After `cargo build --release` and a Claude Code reload, the tools
+`buffer.list`, `buffer.read`, `ast.query`, `edit.replace_range`,
+`edit.replace_node`, `tx.begin`, `tx.commit`, `tx.rollback`, and
+`history.recent` show up in `/mcp` and become callable.
+
+Raw stdio is also usable directly — see `scripts/mcp-smoke.sh` for an
+end-to-end scenario (initialize → list → read → ast.query → edit →
+history → read-back) that the build runs as a regression. Re-run it
+after any protocol or transport change:
+
+```
+cargo build --release && scripts/mcp-smoke.sh
+```
+
+Known scope limits in this iteration:
+- One buffer per `--mcp` invocation; `buffer.open` is implicit from the
+  CLI path.
+- No `view.*`, `symbol.*`, `diag.*`, or `note.pin` yet (those depend on
+  LSP and multi-client awareness, Phases 6 / 8).
+- Edits without an explicit `tx.begin` auto-open + auto-commit a
+  one-shot transaction with a synthetic intent string. Multi-step
+  refactors should call `tx.begin("rename X for clarity")` first.
+
 ## Open questions
 
 - Modal or non-modal? Helix-style or Emacs-style keybinds?
