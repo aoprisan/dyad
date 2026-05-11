@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -37,8 +37,18 @@ pub struct App {
     /// the file extension.
     pub lsp_attempted: bool,
     lsp_version: i32,
+    /// Locations we navigated *from* via cross-file go-to-definition.
+    /// Ctrl-O pops this and re-opens the previous file at its prior
+    /// cursor — vim's `Ctrl-O` jumplist, single-direction.
+    nav_stack: Vec<NavPoint>,
     tx_manager: TxManager,
     quit_pending: bool,
+}
+
+struct NavPoint {
+    path: PathBuf,
+    line: usize,
+    col: usize,
 }
 
 impl App {
@@ -61,6 +71,7 @@ impl App {
             lsp_uri,
             lsp_attempted,
             lsp_version: 0,
+            nav_stack: Vec::new(),
             tx_manager: TxManager::new(),
             quit_pending: false,
         })
@@ -164,6 +175,9 @@ impl App {
             Action::GoToDefinition => {
                 self.status = self.go_to_definition();
             }
+            Action::GoBack => {
+                self.status = self.go_back();
+            }
         }
 
         // Close out the auto-tx. If the mutation didn't actually change
@@ -210,31 +224,122 @@ impl App {
         };
         let line = self.view.cursor_line() as u32;
         let character = self.view.cursor_col() as u32;
-        match lsp.definition(uri, line, character) {
-            Ok(locs) if locs.is_empty() => "No definition found".into(),
-            Ok(locs) => {
-                let loc = &locs[0];
-                if &loc.uri == uri {
-                    self.view.goto(
-                        &self.buffer,
-                        loc.range.start.line as usize,
-                        loc.range.start.character as usize,
-                    );
-                    String::new()
+        let result = lsp.definition(uri, line, character);
+        match result {
+            Ok(locs) if locs.is_empty() => {
+                if self.lsp.as_ref().map(|c| c.is_indexing()).unwrap_or(false) {
+                    "rust-analyzer still indexing — try again in a moment".into()
                 } else {
-                    // App is single-buffer; surface the target so the user
-                    // can open it themselves until multi-buffer lands.
-                    let path = loc.uri.strip_prefix("file://").unwrap_or(&loc.uri);
-                    format!(
-                        "Definition in {}:{}",
-                        path,
-                        loc.range.start.line as usize + 1,
-                    )
+                    "No definition found".into()
+                }
+            }
+            Ok(locs) => {
+                let loc = locs[0].clone();
+                let target_line = loc.range.start.line as usize;
+                let target_col = loc.range.start.character as usize;
+                if Some(&loc.uri) == self.lsp_uri.as_ref() {
+                    self.view.goto(&self.buffer, target_line, target_col);
+                    return String::new();
+                }
+                let Some(target_path) = uri_to_path(&loc.uri) else {
+                    return format!("Definition has unparseable URI {}", loc.uri);
+                };
+                if self.buffer.is_dirty() {
+                    return "Save first — current buffer has unsaved changes".into();
+                }
+                self.push_nav_stack();
+                match self.open_file(&target_path) {
+                    Ok(()) => {
+                        self.view.goto(&self.buffer, target_line, target_col);
+                        // The previous status would otherwise stick around;
+                        // a clean jump is its own feedback.
+                        String::new()
+                    }
+                    Err(e) => {
+                        // Roll back the stack push since we didn't actually
+                        // navigate anywhere.
+                        self.nav_stack.pop();
+                        format!("Could not open {}: {e}", target_path.display())
+                    }
                 }
             }
             Err(e) => format!("Definition lookup failed: {e}"),
         }
     }
+
+    /// Pop the navigation stack and re-open the previous file at its
+    /// stored cursor. No-op (with status) when the stack is empty.
+    fn go_back(&mut self) -> String {
+        let Some(point) = self.nav_stack.pop() else {
+            return "Nothing to go back to".into();
+        };
+        if self.buffer.is_dirty() {
+            // Restore the stack — refusing the jump means the back-pointer
+            // is still valid for the next try.
+            self.nav_stack.push(point);
+            return "Save first — current buffer has unsaved changes".into();
+        }
+        let target_line = point.line;
+        let target_col = point.col;
+        match self.open_file(&point.path) {
+            Ok(()) => {
+                self.view.goto(&self.buffer, target_line, target_col);
+                String::new()
+            }
+            Err(e) => format!("Could not reopen {}: {e}", point.path.display()),
+        }
+    }
+
+    fn push_nav_stack(&mut self) {
+        if let Some(path) = self.buffer.path() {
+            self.nav_stack.push(NavPoint {
+                path: path.to_path_buf(),
+                line: self.view.cursor_line(),
+                col: self.view.cursor_col(),
+            });
+        }
+    }
+
+    /// Swap the current buffer for one rooted at `path`. Resets the view,
+    /// re-runs the tree-sitter parse, refreshes git status, and tells the
+    /// existing LSP client about the new file. The LSP client itself is
+    /// not respawned — rust-analyzer already knows the workspace.
+    fn open_file(&mut self, path: &Path) -> Result<()> {
+        let mut new_buffer = Buffer::open(path.to_path_buf())?;
+        let mut new_syntax = Syntax::for_path(new_buffer.path());
+        if let Some(syn) = new_syntax.as_mut() {
+            syn.refresh(&mut new_buffer);
+        }
+        let new_git_status = compute_git_status(new_buffer.path());
+        let new_uri = new_buffer.path().map(lsp::path_to_uri);
+
+        // Notify LSP about the new document if we have one running and
+        // it's a Rust file. didOpen-on-already-open is well-tolerated by
+        // rust-analyzer (it replaces its view of the document).
+        if let (Some(lsp), Some(uri), Some(p)) = (
+            self.lsp.as_ref(),
+            new_uri.as_ref(),
+            new_buffer.path(),
+        ) && p.extension().and_then(|e| e.to_str()) == Some("rs")
+        {
+            let _ = lsp.did_open(uri, "rust", &new_buffer.rope().to_string());
+        }
+
+        self.buffer = new_buffer;
+        self.syntax = new_syntax;
+        self.git_status = new_git_status;
+        self.lsp_uri = new_uri;
+        self.lsp_version = 0;
+        self.view = View::new();
+        Ok(())
+    }
+}
+
+/// Strip the `file://` scheme and return the underlying filesystem path,
+/// `None` for any URI we can't parse trivially. (Full RFC 8089 handling
+/// can wait — rust-analyzer only emits plain `file://` URIs.)
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    uri.strip_prefix("file://").map(PathBuf::from)
 }
 
 /// Returns `(client, uri, attempted)`. `attempted` is `true` whenever
@@ -271,7 +376,8 @@ fn action_intent(action: &Action) -> Option<String> {
         | Action::PageDown
         | Action::Save
         | Action::Quit
-        | Action::GoToDefinition => None,
+        | Action::GoToDefinition
+        | Action::GoBack => None,
     }
 }
 

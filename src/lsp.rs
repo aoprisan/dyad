@@ -83,12 +83,21 @@ pub struct WorkspaceEdit {
 struct LspState {
     pending: HashMap<i64, Sender<Value>>,
     diagnostics: HashMap<String, Vec<Diagnostic>>,
+    /// `true` once rust-analyzer reports it has finished indexing
+    /// (`experimental/serverStatus` with `quiescent: true`). Starts
+    /// `false` — newly spawned servers are always still indexing.
+    quiescent: bool,
 }
 
 pub struct LspClient {
     state: Arc<Mutex<LspState>>,
     next_id: AtomicI64,
-    stdin: Mutex<ChildStdin>,
+    /// Shared with the reader thread so server-initiated requests
+    /// (`workspace/configuration`, `client/registerCapability`, …) can
+    /// be auto-acked without bouncing through the main thread. We don't
+    /// actually serve any of these, but the server hangs waiting on
+    /// them if we don't reply.
+    stdin: Arc<Mutex<ChildStdin>>,
     child: Mutex<Child>,
     // Thread is detached on drop — the reader exits when stdout closes
     // (which happens when we kill the child below).
@@ -105,10 +114,16 @@ impl LspClient {
         file_uri: &str,
         initial_text: &str,
     ) -> Result<Self> {
+        // Route rust-analyzer's stderr to a log file. Truncated per
+        // spawn so the file contains exactly the current session, which
+        // is what `tail -f /tmp/dyad-lsp.log` from another terminal
+        // needs to surface init / workspace-load / panic output.
+        let log_file = std::fs::File::create("/tmp/dyad-lsp.log")
+            .context("opening /tmp/dyad-lsp.log for rust-analyzer stderr")?;
         let mut child = Command::new("rust-analyzer")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(log_file))
             .spawn()
             .context("spawning rust-analyzer (is `rustup component add rust-analyzer` done?)")?;
         let stdin = child.stdin.take().context("rust-analyzer stdin unavailable")?;
@@ -116,13 +131,16 @@ impl LspClient {
         let state = Arc::new(Mutex::new(LspState {
             pending: HashMap::new(),
             diagnostics: HashMap::new(),
+            quiescent: false,
         }));
+        let stdin = Arc::new(Mutex::new(stdin));
         let reader_state = Arc::clone(&state);
-        let reader = std::thread::spawn(move || reader_loop(stdout, reader_state));
+        let reader_stdin = Arc::clone(&stdin);
+        let reader = std::thread::spawn(move || reader_loop(stdout, reader_state, reader_stdin));
         let client = Self {
             state,
             next_id: AtomicI64::new(1),
-            stdin: Mutex::new(stdin),
+            stdin,
             child: Mutex::new(child),
             _reader: reader,
         };
@@ -148,6 +166,10 @@ impl LspClient {
                         "willSaveWaitUntil": false,
                     },
                 },
+                // rust-analyzer extension: emits `experimental/serverStatus`
+                // notifications with a `quiescent` flag once indexing is
+                // done. We use it to drive the LSP-alive badge state.
+                "experimental": { "serverStatusNotification": true },
             },
             "clientInfo": { "name": "dyad" },
         });
@@ -244,6 +266,14 @@ impl LspClient {
         }
     }
 
+    /// `true` while rust-analyzer is still loading the workspace and
+    /// indexing — definition / hover / diagnostics requests can return
+    /// empty in this window. Flips to `false` on the first
+    /// `experimental/serverStatus` notification with `quiescent: true`.
+    pub fn is_indexing(&self) -> bool {
+        !self.state.lock().unwrap().quiescent
+    }
+
     pub fn diagnostics(&self, uri: &str) -> Vec<Diagnostic> {
         self.state
             .lock()
@@ -294,13 +324,20 @@ impl LspClient {
     }
 
     fn send(&self, msg: &Value) -> Result<()> {
-        let body = serde_json::to_vec(msg)?;
-        let mut stdin = self.stdin.lock().unwrap();
-        write!(stdin, "Content-Length: {}\r\n\r\n", body.len())?;
-        stdin.write_all(&body)?;
-        stdin.flush()?;
-        Ok(())
+        write_message(&self.stdin, msg)
     }
+}
+
+/// Frame a JSON-RPC message and write it to the LSP server's stdin.
+/// Shared between `LspClient::send` and the reader thread's
+/// auto-reply path.
+fn write_message(stdin: &Mutex<ChildStdin>, msg: &Value) -> Result<()> {
+    let body = serde_json::to_vec(msg)?;
+    let mut stdin = stdin.lock().unwrap();
+    write!(stdin, "Content-Length: {}\r\n\r\n", body.len())?;
+    stdin.write_all(&body)?;
+    stdin.flush()?;
+    Ok(())
 }
 
 impl Drop for LspClient {
@@ -314,7 +351,11 @@ impl Drop for LspClient {
     }
 }
 
-fn reader_loop(stdout: ChildStdout, state: Arc<Mutex<LspState>>) {
+fn reader_loop(
+    stdout: ChildStdout,
+    state: Arc<Mutex<LspState>>,
+    stdin: Arc<Mutex<ChildStdin>>,
+) {
     let mut reader = BufReader::new(stdout);
     loop {
         let msg = match read_message(&mut reader) {
@@ -322,21 +363,49 @@ fn reader_loop(stdout: ChildStdout, state: Arc<Mutex<LspState>>) {
             Ok(None) => break, // clean EOF
             Err(_) => break,   // malformed frame — bail rather than spin
         };
-        if let Some(id) = msg.get("id").and_then(Value::as_i64) {
-            let result = msg.get("result").cloned().unwrap_or(Value::Null);
-            let mut s = state.lock().unwrap();
-            if let Some(tx) = s.pending.remove(&id) {
-                let _ = tx.send(result);
+        let id = msg.get("id").cloned();
+        let method = msg.get("method").and_then(Value::as_str);
+
+        match (id, method) {
+            // Server-initiated request: any message with both id and
+            // method. We don't actually serve any of these (config,
+            // capability registration, progress tokens, …) but the
+            // server hangs if we don't reply, which blocks workspace
+            // load and makes definition queries return empty.
+            (Some(id), Some(_)) => {
+                let reply = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": Value::Null,
+                });
+                let _ = write_message(&stdin, &reply);
             }
-        } else if let Some(method) = msg.get("method").and_then(Value::as_str) {
-            // The only server-to-client notification we consume is
-            // publishDiagnostics; window/logMessage and progress
-            // updates are intentionally dropped.
-            if method == "textDocument/publishDiagnostics"
-                && let Some(params) = msg.get("params")
-            {
-                update_diagnostics(&state, params);
+            // Response to one of our pending requests.
+            (Some(id), None) => {
+                if let Some(id) = id.as_i64() {
+                    let result = msg.get("result").cloned().unwrap_or(Value::Null);
+                    let mut s = state.lock().unwrap();
+                    if let Some(tx) = s.pending.remove(&id) {
+                        let _ = tx.send(result);
+                    }
+                }
             }
+            // Server notification (no id). We only consume the two we
+            // care about; window/logMessage and `$/progress` are dropped.
+            (None, Some(method)) => match method {
+                "textDocument/publishDiagnostics" => {
+                    if let Some(params) = msg.get("params") {
+                        update_diagnostics(&state, params);
+                    }
+                }
+                "experimental/serverStatus" => {
+                    if let Some(params) = msg.get("params") {
+                        update_quiescent(&state, params);
+                    }
+                }
+                _ => {}
+            },
+            (None, None) => {}
         }
     }
     // The server's stdout is gone. Drop all pending Senders so any
@@ -360,6 +429,17 @@ fn update_diagnostics(state: &Arc<Mutex<LspState>>, params: &Value) {
         .unwrap()
         .diagnostics
         .insert(uri.to_string(), diags);
+}
+
+/// Handle a rust-analyzer `experimental/serverStatus` notification.
+/// The `quiescent` field flips to `true` once the workspace has been
+/// loaded and indexed — that's when LSP requests start returning real
+/// results instead of empty.
+fn update_quiescent(state: &Arc<Mutex<LspState>>, params: &Value) {
+    let Some(q) = params.get("quiescent").and_then(Value::as_bool) else {
+        return;
+    };
+    state.lock().unwrap().quiescent = q;
 }
 
 fn read_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>> {
@@ -388,23 +468,31 @@ fn read_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>> {
     Ok(Some(serde_json::from_slice(&buf)?))
 }
 
-/// Encode a filesystem path as a `file://` URI. Uses absolute form via
-/// `canonicalize` when possible.
+/// Encode a filesystem path as an absolute `file://` URI. Tries
+/// `canonicalize` first (works for existing files); for new files
+/// (e.g. opened to be created on first save) falls back to
+/// `current_dir().join(path)` so the URI is still absolute. A relative
+/// `file://src/main.rs` URI looks valid but rust-analyzer parses the
+/// empty/relative root as `/`, which breaks workspace discovery.
 pub fn path_to_uri(path: &Path) -> String {
-    let abs = path
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(path));
+    let abs = absolutize(path);
     format!("file://{}", abs.display())
 }
 
 /// Walk upward from `path` looking for the nearest directory that
 /// contains a `Cargo.toml`. Falls back to `path`'s parent if none is
 /// found — rust-analyzer copes either way, just with less context.
+///
+/// Absolutizes `path` up-front: with a relative input like `src/main.rs`
+/// the loop would otherwise terminate at an empty `PathBuf`, and a
+/// downstream `file://` URI on that empty path makes rust-analyzer log
+/// `failed to find any projects in [AbsPathBuf("/")]`.
 pub fn workspace_root_for(path: &Path) -> PathBuf {
-    let mut cur = path
+    let abs = absolutize(path);
+    let mut cur = abs
         .parent()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .unwrap_or_else(|| PathBuf::from("/"));
     loop {
         if cur.join("Cargo.toml").exists() {
             return cur;
@@ -412,12 +500,28 @@ pub fn workspace_root_for(path: &Path) -> PathBuf {
         match cur.parent() {
             Some(parent) => cur = parent.to_path_buf(),
             None => {
-                return path
+                return abs
                     .parent()
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("."));
+                    .unwrap_or_else(|| PathBuf::from("/"));
             }
         }
+    }
+}
+
+/// Best-effort absolute form of `path`. Prefers `canonicalize` (resolves
+/// symlinks, errors for non-existent paths); on failure joins onto the
+/// current working directory; final fallback keeps the input as-is.
+fn absolutize(path: &Path) -> PathBuf {
+    if let Ok(abs) = path.canonicalize() {
+        return abs;
+    }
+    if path.is_absolute() {
+        return PathBuf::from(path);
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => PathBuf::from(path),
     }
 }
 
@@ -474,6 +578,7 @@ mod tests {
         let state = Arc::new(Mutex::new(LspState {
             pending: HashMap::new(),
             diagnostics: HashMap::new(),
+            quiescent: false,
         }));
         let params = json!({
             "uri": "file:///tmp/x.rs",

@@ -14,4 +14,5 @@ pub enum Action {
     Save,
     Quit,
     GoToDefinition,
+    GoBack,
 }

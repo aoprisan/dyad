@@ -43,7 +43,8 @@ Non-modal — letter keys always insert.
 | -------------------- | ----------------------------------- |
 | Arrows / Alt+h,j,k,l | Move cursor                         |
 | Ctrl-S               | Save                                |
-| Ctrl-]               | Go to definition (LSP, Rust files)  |
+| Ctrl-G (or F12, Ctrl-]) | Go to definition (LSP, Rust files) |
+| Ctrl-O               | Jump back (navigation stack)        |
 | Ctrl-Q               | Quit                                |
 
 LSP-backed features (diagnostics on the status bar, go-to-definition) light up

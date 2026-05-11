@@ -14,6 +14,7 @@ mod proposals;
 mod protocol;
 mod syntax;
 mod terminal;
+mod theme;
 mod tx;
 mod ui;
 mod view;

@@ -1,12 +1,12 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::App;
 use crate::git::LineStatus;
 use crate::syntax::{self, HighlightSpan};
+use crate::theme;
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -46,7 +46,7 @@ fn render_gutter(frame: &mut Frame, rect: Rect, app: &App, gutter_width: u16) {
     let mut lines = Vec::with_capacity(rows);
     // Reserve the last column for the git status marker.
     let number_width = (gutter_width as usize).saturating_sub(2);
-    let dim = Style::default().fg(Color::DarkGray);
+    let number_style = theme::gutter();
     for r in 0..rows {
         let line_idx = app.view.top_line() + r;
         if line_idx >= total_lines {
@@ -55,19 +55,20 @@ fn render_gutter(frame: &mut Frame, rect: Rect, app: &App, gutter_width: u16) {
         }
         let number = Span::styled(
             format!("{:>width$}", line_idx + 1, width = number_width),
-            dim,
+            number_style,
         );
         let marker = git_marker_span(app, line_idx);
         lines.push(Line::from(vec![number, Span::raw(" "), marker]));
     }
-    frame.render_widget(Paragraph::new(lines), rect);
+    frame.render_widget(Paragraph::new(lines).style(theme::gutter()), rect);
 }
 
 fn git_marker_span(app: &App, line_idx: usize) -> Span<'static> {
+    let bg = theme::gutter();
     match app.git_status.get(&line_idx) {
-        Some(LineStatus::Added) => Span::styled("+", Style::default().fg(Color::Green)),
-        Some(LineStatus::Modified) => Span::styled("~", Style::default().fg(Color::Yellow)),
-        Some(LineStatus::DeletedAbove) => Span::styled("\u{203E}", Style::default().fg(Color::Red)),
+        Some(LineStatus::Added) => Span::styled("+", bg.fg(theme::ok())),
+        Some(LineStatus::Modified) => Span::styled("~", bg.fg(theme::warn())),
+        Some(LineStatus::DeletedAbove) => Span::styled("\u{203E}", bg.fg(theme::error())),
         None => Span::raw(" "),
     }
 }
@@ -104,7 +105,7 @@ fn render_text(frame: &mut Frame, rect: Rect, app: &App) {
             .unwrap_or(&[]);
         lines.push(build_line(&chars, spans));
     }
-    frame.render_widget(Paragraph::new(lines), rect);
+    frame.render_widget(Paragraph::new(lines).style(theme::editor()), rect);
 }
 
 /// Slice `chars` into ratatui spans, applying the style for each highlight.
@@ -158,26 +159,14 @@ fn render_status(frame: &mut Frame, rect: Rect, app: &App) {
         line = app.view.cursor_line() + 1,
         col = app.view.cursor_col() + 1,
     );
-    let bar = Style::default()
-        .bg(Color::DarkGray)
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
-    // Hints share the bar's bg/fg but drop BOLD so they sit a step quieter than the path.
-    let hint = Style::default().bg(Color::DarkGray).fg(Color::White);
+    let bar = theme::status_bar();
+    let hint = theme::status_hint();
 
     // Right side precedence: transient status > current-line diagnostic > hints.
     let (right_text, right_style) = if !app.status.is_empty() {
         (format!(" {} ", app.status), bar)
     } else if let Some((label, severity)) = current_line_diagnostic(app) {
-        let fg = match severity {
-            Some(1) => Color::Red,
-            Some(2) => Color::Yellow,
-            _ => Color::White,
-        };
-        let style = Style::default()
-            .bg(Color::DarkGray)
-            .fg(fg)
-            .add_modifier(Modifier::BOLD);
+        let style = theme::status_bar().fg(theme::diagnostic(severity));
         (label, style)
     } else {
         (HINT_TEXT.to_string(), hint)
@@ -207,22 +196,21 @@ fn lsp_badge_span(app: &App) -> Option<Span<'static>> {
     if !app.lsp_attempted {
         return None;
     }
-    let (text, fg) = if app.lsp.is_some() {
-        ("lsp ", Color::Green)
-    } else {
+    let (text, fg) = match app.lsp.as_ref() {
+        Some(client) if client.is_indexing() => {
+            // Yellow while rust-analyzer is loading the workspace.
+            // Definition/diagnostic requests return empty in this window.
+            ("lsp… ", theme::warn())
+        }
+        Some(_) => ("lsp ", theme::ok()),
         // Tried and failed — most often rust-analyzer not on PATH.
-        ("lsp! ", Color::Red)
+        None => ("lsp! ", theme::error()),
     };
-    Some(Span::styled(
-        text,
-        Style::default()
-            .bg(Color::DarkGray)
-            .fg(fg)
-            .add_modifier(Modifier::BOLD),
-    ))
+    Some(Span::styled(text, theme::status_bar().fg(fg)))
 }
 
-const HINT_TEXT: &str = " Ctrl-S save · Ctrl-] def · Ctrl-Q quit · Alt+h/j/k/l move ";
+const HINT_TEXT: &str =
+    " Ctrl-S save · Ctrl-G def · Ctrl-O back · Ctrl-Q quit · Alt+h/j/k/l move ";
 
 /// First LSP diagnostic that starts on the cursor line, formatted for
 /// the status bar. Returns `(text, severity)` so the caller can colorize.

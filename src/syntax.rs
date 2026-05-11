@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ropey::Rope;
 use serde::Serialize;
 use tree_sitter::{InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree};
@@ -345,25 +345,12 @@ fn printable_line_len(rope: &Rope, line: usize) -> usize {
 }
 
 pub fn style_for(capture_idx: usize) -> Style {
-    let base = Style::default();
     let Some(name) = HIGHLIGHT_NAMES.get(capture_idx).copied() else {
-        return base;
+        return Style::default();
     };
     // Match on the primary capture name; ignore the dotted sub-category.
     let primary = name.split('.').next().unwrap_or("");
-    match primary {
-        "comment" => base.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-        "keyword" => base.fg(Color::Magenta).add_modifier(Modifier::BOLD),
-        "string" => base.fg(Color::Green),
-        "number" | "constant" => base.fg(Color::Yellow),
-        "function" => base.fg(Color::Cyan),
-        "type" => base.fg(Color::Blue),
-        "attribute" => base.fg(Color::LightYellow),
-        "property" => base.fg(Color::LightBlue),
-        "tag" | "label" => base.fg(Color::Magenta),
-        "punctuation" => base.fg(Color::Gray),
-        _ => base,
-    }
+    crate::theme::syntax(primary)
 }
 
 #[cfg(test)]
