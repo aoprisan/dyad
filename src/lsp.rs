@@ -183,6 +183,15 @@ impl LspClient {
         )
     }
 
+    pub fn did_close(&self, uri: &str) -> Result<()> {
+        self.notify(
+            "textDocument/didClose",
+            json!({
+                "textDocument": { "uri": uri }
+            }),
+        )
+    }
+
     pub fn definition(
         &self,
         uri: &str,

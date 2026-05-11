@@ -99,6 +99,24 @@ fn tools_list_result() -> Value {
                 "type": "object",
                 "properties": {},
             })),
+            tool_def("buffer.open", "Open a file as an additional buffer; returns the new buffer_id.", json!({
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"},
+                },
+            })),
+            tool_def("buffer.close", "Close a buffer by id. If it's the focused buffer, focus shifts to the lowest remaining id (or None when no buffers remain).", json!({
+                "type": "object",
+                "required": ["buffer_id"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                },
+            })),
+            tool_def("clients.list", "List active clients with id, kind (agent | human), and currently focused buffer_id.", json!({
+                "type": "object",
+                "properties": {},
+            })),
             tool_def("buffer.read", "Read all or part of a buffer's text. Returns {text, version}.", json!({
                 "type": "object",
                 "required": ["buffer_id"],
@@ -156,10 +174,11 @@ fn tools_list_result() -> Value {
                     "text": {"type": "string"},
                 },
             })),
-            tool_def("tx.begin", "Open a transaction with a stated intent. Subsequent edits join this tx until tx.commit or tx.rollback.", json!({
+            tool_def("tx.begin", "Open a transaction against `buffer_id` with a stated intent. Subsequent edits to that buffer join this tx until tx.commit or tx.rollback.", json!({
                 "type": "object",
-                "required": ["intent"],
+                "required": ["buffer_id", "intent"],
                 "properties": {
+                    "buffer_id": {"type": "integer"},
                     "intent": {"type": "string"},
                     "conversation_id": {"type": "string"},
                 },
@@ -253,6 +272,25 @@ fn dispatch_tool(
 ) -> Result<Value> {
     match name {
         "buffer.list" => Ok(json!(state.buffer_list())),
+        "buffer.open" => {
+            #[derive(Deserialize)]
+            struct Args {
+                path: String,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            let id = state.buffer_open(std::path::PathBuf::from(a.path))?;
+            Ok(json!({ "buffer_id": id }))
+        }
+        "buffer.close" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            state.buffer_close(a.buffer_id)?;
+            Ok(json!({}))
+        }
+        "clients.list" => Ok(json!(state.clients_list())),
         "buffer.read" => {
             #[derive(Deserialize)]
             struct Args {
@@ -298,11 +336,12 @@ fn dispatch_tool(
         "tx.begin" => {
             #[derive(Deserialize)]
             struct Args {
+                buffer_id: u64,
                 intent: String,
                 conversation_id: Option<String>,
             }
             let a: Args = serde_json::from_value(args)?;
-            let tx_id = state.tx_begin(a.intent, a.conversation_id)?;
+            let tx_id = state.tx_begin(a.buffer_id, a.intent, a.conversation_id)?;
             Ok(json!({ "tx_id": tx_id }))
         }
         "tx.commit" => {
@@ -490,6 +529,9 @@ mod tests {
             "symbol.definition",
             "diag.current",
             "edit.rename_symbol",
+            "buffer.open",
+            "buffer.close",
+            "clients.list",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -515,7 +557,7 @@ mod tests {
     fn end_to_end_buffer_read_round_trip() {
         let mut state = fresh_state("buffer_read");
         // Seed via the protocol layer to keep this test purely MCP-shaped.
-        let v0 = state.buffer_version();
+        let v0 = state.buffer_version(SOLE_BUFFER_ID).unwrap();
         state
             .edit_replace_range(
                 SOLE_BUFFER_ID,
@@ -545,7 +587,7 @@ mod tests {
     fn end_to_end_edit_then_history() {
         let mut state = fresh_state("edit_history");
         // edit.replace_range via MCP.
-        let v0 = state.buffer_version();
+        let v0 = state.buffer_version(SOLE_BUFFER_ID).unwrap();
         let edit_resp = call_tool(
             &mut state,
             "edit.replace_range",
@@ -585,7 +627,7 @@ mod tests {
     #[test]
     fn version_mismatch_returns_is_error_true() {
         let mut state = fresh_state("version_err");
-        let bad_version = state.buffer_version() + 99;
+        let bad_version = state.buffer_version(SOLE_BUFFER_ID).unwrap() + 99;
         let resp = call_tool(
             &mut state,
             "edit.replace_range",

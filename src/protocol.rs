@@ -1,18 +1,20 @@
-//! Phase 4 — the protocol layer.
+//! Phase 4–8 — the protocol layer.
 //!
-//! `ProtocolState` owns the editor-as-runtime state (one buffer + syntax +
-//! transaction manager) and exposes each DESIGN.md operation as a typed
-//! Rust method. `mcp.rs` is one transport over this surface; tests call
-//! the methods directly.
+//! `ProtocolState` owns the editor-as-runtime state — a collection of
+//! buffers (Phase 8), each with its own `Syntax` + LSP URI + LSP version
+//! — plus a shared `TxManager` and an optional shared `LspClient`.
+//! Methods are one-per-DESIGN.md-verb; `mcp.rs` is one transport over
+//! this surface and tests call the methods directly.
 //!
-//! Every edit goes through a transaction. If a caller hasn't opened an
-//! explicit `tx.begin`, the edit auto-opens / auto-commits a one-shot
-//! transaction so the flat history still gets an entry — matching the
-//! "every edit happens inside a transaction" requirement from DESIGN.md
-//! §Transactions & intent.
+//! Edits go through transactions. With no explicit `tx.begin` open, an
+//! edit auto-opens / auto-commits a one-shot transaction so the flat
+//! history still gets an entry. Phase 8's `edit_rename_symbol` runs a
+//! *per-buffer* auto-tx for each affected buffer — true cross-buffer
+//! atomicity is deferred until cross-buffer transactions exist.
 
+use std::collections::HashMap;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -22,43 +24,47 @@ use crate::lsp::{self, Diagnostic, Location, LspClient, TextEdit};
 use crate::syntax::{AstMatch, Syntax};
 use crate::tx::{Change, ChangeId, TxId, TxManager};
 
+/// The first buffer always gets this id, so back-compat with the
+/// pre-Phase-8 single-buffer tests holds.
+pub const SOLE_BUFFER_ID: u64 = 1;
+
 pub struct ProtocolState {
+    next_buffer_id: u64,
+    buffers: HashMap<u64, BufferEntry>,
+    /// Which buffer the agent currently considers "focused" — surfaced
+    /// via `clients.list`. Updates whenever a new buffer is opened or
+    /// the focused buffer is closed.
+    focus: Option<u64>,
+    tx_manager: TxManager,
+    /// At most one explicit transaction at a time; the buffer it
+    /// targets is recorded so per-buffer edits know whether to auto-tx.
+    explicit_tx: Option<(TxId, u64)>,
+    /// Shared rust-analyzer connection. The first .rs buffer opened
+    /// spawns it; subsequent .rs buffers in the same workspace reuse
+    /// it via additional `didOpen` notifications.
+    lsp: Option<LspClient>,
+    workspace_root: Option<PathBuf>,
+    /// Stable identifier for this client (the current MCP session).
+    /// Surfaced via `clients.list`.
+    client_id: String,
+}
+
+struct BufferEntry {
+    id: u64,
     buffer: Buffer,
     syntax: Option<Syntax>,
-    tx_manager: TxManager,
-    /// Currently open explicit transaction, if any. Edits join this tx
-    /// rather than auto-wrapping themselves.
-    explicit_tx: Option<TxId>,
-    /// Optional rust-analyzer connection. `None` when the file isn't
-    /// Rust, doesn't live in a Cargo workspace, or rust-analyzer
-    /// couldn't be spawned — the protocol still works, just without
-    /// semantic tools.
-    lsp: Option<LspClient>,
-    /// `file://...` URI for the buffer. Set whenever the buffer has a
-    /// path; LSP tools require this to be `Some`.
-    buffer_uri: Option<String>,
-    /// Monotonic LSP document version (separate from `Buffer::version`
-    /// because LSP needs an i32 starting at 0).
+    uri: Option<String>,
+    /// Per-buffer monotonic LSP document version (LSP needs an i32
+    /// starting at 0 and incrementing on each `didChange`).
     lsp_version: i32,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct BufferEntry {
+pub struct BufferListEntry {
     pub id: u64,
     pub path: Option<String>,
     pub dirty: bool,
     pub version: u64,
-}
-
-/// Outcome of `edit_rename_symbol`. `applied` counts the in-buffer
-/// edits we successfully wrote; `skipped_files` are the other URIs the
-/// LSP server wanted to touch but which aren't loaded as `dyad`'s
-/// active buffer. The agent must re-target those separately.
-#[derive(Clone, Debug, Serialize)]
-pub struct RenameResult {
-    pub applied: usize,
-    pub new_version: u64,
-    pub skipped_files: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -79,42 +85,117 @@ pub struct ByteRange {
     pub end: usize,
 }
 
-/// We only host one buffer for now (Phase 8 brings multi-buffer +
-/// awareness). The MCP layer accepts a `buffer_id` field for forward
-/// compatibility but currently rejects anything but `SOLE_BUFFER_ID`.
-pub const SOLE_BUFFER_ID: u64 = 1;
+#[derive(Clone, Debug, Serialize)]
+pub struct RenameApplied {
+    pub buffer_id: u64,
+    pub uri: String,
+    pub edits: usize,
+    pub new_version: u64,
+}
+
+/// Outcome of `edit_rename_symbol`. `applied` lists every loaded
+/// buffer whose changes we wrote (with the per-buffer edit count and
+/// new version). `skipped_files` are URIs the LSP server wanted to
+/// touch but which aren't currently loaded as buffers — the agent
+/// must `buffer.open` them and re-target (Phase 8 keeps rename
+/// per-buffer; cross-buffer atomic txes are a follow-up).
+#[derive(Clone, Debug, Serialize)]
+pub struct RenameResult {
+    pub applied: Vec<RenameApplied>,
+    pub skipped_files: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ClientInfo {
+    pub id: String,
+    /// "agent" for an MCP session, "human" once a TUI client lands.
+    pub kind: String,
+    pub focus: Option<u64>,
+}
 
 impl ProtocolState {
     pub fn open(path: PathBuf) -> Result<Self> {
+        let mut state = Self {
+            next_buffer_id: SOLE_BUFFER_ID,
+            buffers: HashMap::new(),
+            focus: None,
+            tx_manager: TxManager::new(),
+            explicit_tx: None,
+            lsp: None,
+            workspace_root: None,
+            client_id: format!("mcp-{}", std::process::id()),
+        };
+        state.buffer_open(path)?;
+        Ok(state)
+    }
+
+    // ---------- Buffers ----------
+
+    /// Add a buffer to the protocol state. The first call returns
+    /// `SOLE_BUFFER_ID` (=1); subsequent calls allocate fresh ids.
+    /// For .rs files this also lazily spawns rust-analyzer for the
+    /// workspace and forwards a `didOpen`.
+    pub fn buffer_open(&mut self, path: PathBuf) -> Result<u64> {
+        let id = self.next_buffer_id;
+        self.next_buffer_id += 1;
+
         let mut buffer = Buffer::open(path)?;
         let mut syntax = Syntax::for_path(buffer.path());
         if let Some(syn) = syntax.as_mut() {
             syn.refresh(&mut buffer);
         }
-        let (lsp, buffer_uri) = try_spawn_lsp(&buffer);
-        Ok(Self {
-            buffer,
-            syntax,
-            tx_manager: TxManager::new(),
-            explicit_tx: None,
-            lsp,
-            buffer_uri,
-            lsp_version: 0,
-        })
+        let uri = buffer.path().map(lsp::path_to_uri);
+
+        if let (Some(p), Some(u)) = (buffer.path(), uri.as_ref())
+            && p.extension().and_then(|e| e.to_str()) == Some("rs")
+        {
+            self.ensure_lsp_or_open(p, u, &buffer.rope().to_string());
+        }
+
+        self.buffers.insert(
+            id,
+            BufferEntry {
+                id,
+                buffer,
+                syntax,
+                uri,
+                lsp_version: 0,
+            },
+        );
+        self.focus = Some(id);
+        Ok(id)
     }
 
-    // ---------- Buffers ----------
+    /// Remove a buffer. If the focused buffer is closed, focus moves
+    /// to the lowest-id remaining buffer (or `None` if no buffers
+    /// remain). LSP gets a best-effort `didClose`.
+    pub fn buffer_close(&mut self, buffer_id: u64) -> Result<()> {
+        let entry = self
+            .buffers
+            .remove(&buffer_id)
+            .ok_or_else(|| anyhow!("unknown buffer_id {}", buffer_id))?;
+        if let (Some(lsp), Some(uri)) = (self.lsp.as_ref(), entry.uri.as_ref()) {
+            let _ = lsp.did_close(uri);
+        }
+        if self.focus == Some(buffer_id) {
+            self.focus = self.buffers.keys().min().copied();
+        }
+        Ok(())
+    }
 
-    pub fn buffer_list(&self) -> Vec<BufferEntry> {
-        vec![BufferEntry {
-            id: SOLE_BUFFER_ID,
-            path: self
-                .buffer
-                .path()
-                .map(|p| p.display().to_string()),
-            dirty: self.buffer.is_dirty(),
-            version: self.buffer.version(),
-        }]
+    pub fn buffer_list(&self) -> Vec<BufferListEntry> {
+        let mut list: Vec<_> = self
+            .buffers
+            .values()
+            .map(|e| BufferListEntry {
+                id: e.id,
+                path: e.buffer.path().map(|p| p.display().to_string()),
+                dirty: e.buffer.is_dirty(),
+                version: e.buffer.version(),
+            })
+            .collect();
+        list.sort_by_key(|e| e.id);
+        list
     }
 
     pub fn buffer_read(
@@ -122,8 +203,8 @@ impl ProtocolState {
         buffer_id: u64,
         range: Option<CharRange>,
     ) -> Result<BufferReadResponse> {
-        self.check_buffer(buffer_id)?;
-        let rope = self.buffer.rope();
+        let entry = self.buffer_entry(buffer_id)?;
+        let rope = entry.buffer.rope();
         let text = match range {
             None => rope.to_string(),
             Some(r) => {
@@ -140,19 +221,19 @@ impl ProtocolState {
         };
         Ok(BufferReadResponse {
             text,
-            version: self.buffer.version(),
+            version: entry.buffer.version(),
         })
     }
 
     // ---------- AST ----------
 
     pub fn ast_query(&self, buffer_id: u64, query: &str) -> Result<Vec<AstMatch>> {
-        self.check_buffer(buffer_id)?;
-        let syn = self
+        let entry = self.buffer_entry(buffer_id)?;
+        let syn = entry
             .syntax
             .as_ref()
             .context("buffer has no syntax (unsupported language)")?;
-        syn.ast_query(self.buffer.rope(), query)
+        syn.ast_query(entry.buffer.rope(), query)
     }
 
     // ---------- Edits ----------
@@ -164,31 +245,32 @@ impl ProtocolState {
         range: CharRange,
         text: &str,
     ) -> Result<u64> {
-        self.check_buffer(buffer_id)?;
-        self.check_version(version)?;
-        if range.start > range.end || range.end > self.buffer.len_chars() {
-            return Err(anyhow!(
-                "range {}..{} outside buffer (len_chars = {})",
-                range.start,
-                range.end,
-                self.buffer.len_chars()
-            ));
+        self.check_version(buffer_id, version)?;
+        {
+            let entry = self.buffer_entry(buffer_id)?;
+            if range.start > range.end || range.end > entry.buffer.len_chars() {
+                return Err(anyhow!(
+                    "range {}..{} outside buffer (len_chars = {})",
+                    range.start,
+                    range.end,
+                    entry.buffer.len_chars()
+                ));
+            }
         }
-        self.with_auto_tx(
-            || format!("edit.replace_range {}..{}", range.start, range.end),
-            |s| {
-                if range.start < range.end {
-                    s.buffer.delete_range(range.start..range.end);
-                }
-                if !text.is_empty() {
-                    s.buffer.insert_str(range.start, text);
-                }
-                Ok(())
-            },
-        )?;
-        self.refresh_syntax();
-        self.notify_lsp_changed();
-        Ok(self.buffer.version())
+        let intent = format!("edit.replace_range {}..{}", range.start, range.end);
+        let text_owned = text.to_string();
+        self.with_auto_tx_on(buffer_id, intent, move |entry| {
+            if range.start < range.end {
+                entry.buffer.delete_range(range.start..range.end);
+            }
+            if !text_owned.is_empty() {
+                entry.buffer.insert_str(range.start, &text_owned);
+            }
+            Ok(())
+        })?;
+        self.refresh_syntax(buffer_id);
+        self.notify_lsp_changed(buffer_id);
+        Ok(self.buffer_entry(buffer_id)?.buffer.version())
     }
 
     pub fn edit_replace_node(
@@ -198,36 +280,40 @@ impl ProtocolState {
         byte_range: ByteRange,
         text: &str,
     ) -> Result<u64> {
-        self.check_buffer(buffer_id)?;
-        self.check_version(version)?;
-        if byte_range.start > byte_range.end || byte_range.end > self.buffer.rope().len_bytes() {
-            return Err(anyhow!(
-                "byte range {}..{} outside buffer (len_bytes = {})",
-                byte_range.start,
-                byte_range.end,
-                self.buffer.rope().len_bytes()
-            ));
+        self.check_version(buffer_id, version)?;
+        {
+            let entry = self.buffer_entry(buffer_id)?;
+            if byte_range.start > byte_range.end
+                || byte_range.end > entry.buffer.rope().len_bytes()
+            {
+                return Err(anyhow!(
+                    "byte range {}..{} outside buffer (len_bytes = {})",
+                    byte_range.start,
+                    byte_range.end,
+                    entry.buffer.rope().len_bytes()
+                ));
+            }
         }
         let range = Range {
             start: byte_range.start,
             end: byte_range.end,
         };
-        self.with_auto_tx(
-            || format!("edit.replace_node {}..{}", byte_range.start, byte_range.end),
-            |s| {
-                s.buffer.replace_node(range, text);
-                Ok(())
-            },
-        )?;
-        self.refresh_syntax();
-        self.notify_lsp_changed();
-        Ok(self.buffer.version())
+        let intent = format!("edit.replace_node {}..{}", byte_range.start, byte_range.end);
+        let text_owned = text.to_string();
+        self.with_auto_tx_on(buffer_id, intent, move |entry| {
+            entry.buffer.replace_node(range, &text_owned);
+            Ok(())
+        })?;
+        self.refresh_syntax(buffer_id);
+        self.notify_lsp_changed(buffer_id);
+        Ok(self.buffer_entry(buffer_id)?.buffer.version())
     }
 
     // ---------- Transactions ----------
 
     pub fn tx_begin(
         &mut self,
+        buffer_id: u64,
         intent: String,
         conversation_id: Option<String>,
     ) -> Result<TxId> {
@@ -236,39 +322,43 @@ impl ProtocolState {
                 "a transaction is already open; commit or rollback it first"
             ));
         }
-        let tx_id = self.tx_manager.begin(intent, conversation_id, &self.buffer);
-        self.explicit_tx = Some(tx_id);
+        let entry = self
+            .buffers
+            .get(&buffer_id)
+            .ok_or_else(|| anyhow!("unknown buffer_id {}", buffer_id))?;
+        let tx_id = self
+            .tx_manager
+            .begin(intent, conversation_id, &entry.buffer);
+        self.explicit_tx = Some((tx_id, buffer_id));
         Ok(tx_id)
     }
 
     pub fn tx_commit(&mut self, tx_id: TxId) -> Result<ChangeId> {
-        if self.explicit_tx != Some(tx_id) {
-            return Err(anyhow!(
-                "tx_id {:?} is not the currently open transaction",
-                tx_id
-            ));
-        }
-        let change_id = self.tx_manager.commit(tx_id, &self.buffer)?;
+        let buffer_id = self.tx_buffer_for(tx_id)?;
+        let entry = self
+            .buffers
+            .get(&buffer_id)
+            .ok_or_else(|| anyhow!("unknown buffer_id {}", buffer_id))?;
+        let change_id = self.tx_manager.commit(tx_id, &entry.buffer)?;
         self.explicit_tx = None;
         Ok(change_id)
     }
 
     pub fn tx_rollback(&mut self, tx_id: TxId) -> Result<()> {
-        if self.explicit_tx != Some(tx_id) {
-            return Err(anyhow!(
-                "tx_id {:?} is not the currently open transaction",
-                tx_id
-            ));
+        let buffer_id = self.tx_buffer_for(tx_id)?;
+        {
+            let entry = self
+                .buffers
+                .get_mut(&buffer_id)
+                .ok_or_else(|| anyhow!("unknown buffer_id {}", buffer_id))?;
+            self.tx_manager.rollback(tx_id, &mut entry.buffer)?;
+            if let Some(syn) = entry.syntax.as_mut() {
+                syn.invalidate();
+            }
         }
-        self.tx_manager.rollback(tx_id, &mut self.buffer)?;
         self.explicit_tx = None;
-        // The cached syntax tree is now stale relative to the restored
-        // rope — drop it so the next refresh does a full reparse.
-        if let Some(syn) = self.syntax.as_mut() {
-            syn.invalidate();
-        }
-        self.refresh_syntax();
-        self.notify_lsp_changed();
+        self.refresh_syntax(buffer_id);
+        self.notify_lsp_changed(buffer_id);
         Ok(())
     }
 
@@ -276,6 +366,18 @@ impl ProtocolState {
 
     pub fn history_recent(&self, limit: usize) -> Vec<Change> {
         self.tx_manager.recent(limit).to_vec()
+    }
+
+    // ---------- Clients ----------
+
+    pub fn clients_list(&self) -> Vec<ClientInfo> {
+        // Phase 8 baseline: just the current MCP session. Awareness of
+        // a concurrent TUI client comes after the planned daemon split.
+        vec![ClientInfo {
+            id: self.client_id.clone(),
+            kind: "agent".into(),
+            focus: self.focus,
+        }]
     }
 
     // ---------- Semantic (LSP) ----------
@@ -286,43 +388,42 @@ impl ProtocolState {
         line: u32,
         character: u32,
     ) -> Result<Vec<Location>> {
-        self.check_buffer(buffer_id)?;
+        let entry = self.buffer_entry(buffer_id)?;
         let lsp = self
             .lsp
             .as_ref()
             .context("rust-analyzer not running (see `rustup component add rust-analyzer`)")?;
-        let uri = self
-            .buffer_uri
+        let uri = entry
+            .uri
             .as_ref()
             .context("buffer has no file URI; cannot query LSP")?;
         lsp.definition(uri, line, character)
     }
 
     pub fn diag_current(&self, buffer_id: u64) -> Result<Vec<Diagnostic>> {
-        self.check_buffer(buffer_id)?;
+        let entry = self.buffer_entry(buffer_id)?;
         let lsp = self
             .lsp
             .as_ref()
             .context("rust-analyzer not running (see `rustup component add rust-analyzer`)")?;
-        let uri = self
-            .buffer_uri
+        let uri = entry
+            .uri
             .as_ref()
             .context("buffer has no file URI; cannot query LSP")?;
         Ok(lsp.diagnostics(uri))
     }
 
-    /// Phase 7 tier-3 edit: ask the LSP server for the workspace edits
+    /// Phase 7/8 tier-3 edit: ask rust-analyzer for the workspace edits
     /// required to rename the symbol at `(line, character)` to
-    /// `new_name`, then apply the in-buffer subset as a single
-    /// transaction. Cross-file edits aren't applied here — they come
-    /// back in `skipped_files` so the caller can re-target via another
-    /// `--mcp` invocation (Phase 8 brings real multi-buffer).
+    /// `new_name`, then apply the changes to every loaded buffer the
+    /// server wants to touch (one per-buffer auto-tx each). URIs the
+    /// server names but which aren't loaded come back in
+    /// `skipped_files` — the agent can `buffer.open` them and re-run.
     ///
     /// LSP positions are line + UTF-16 code units. dyad's rope is char
-    /// indexed (Unicode scalar values), so this conversion is exact
-    /// for BMP-only source — which covers nearly all Rust code. Files
-    /// with non-BMP characters (rare emoji-in-string-literal cases)
-    /// will mis-position; that's a known limitation here.
+    /// indexed (Unicode scalar values), so the conversion is exact for
+    /// BMP-only source. Files with non-BMP characters will mis-position;
+    /// that's a known limitation.
     pub fn edit_rename_symbol(
         &mut self,
         buffer_id: u64,
@@ -331,148 +432,217 @@ impl ProtocolState {
         character: u32,
         new_name: String,
     ) -> Result<RenameResult> {
-        self.check_buffer(buffer_id)?;
-        self.check_version(version)?;
+        self.check_version(buffer_id, version)?;
+        let request_uri = self
+            .buffer_entry(buffer_id)?
+            .uri
+            .clone()
+            .context("buffer has no file URI; cannot query LSP")?;
         let lsp = self
             .lsp
             .as_ref()
             .context("rust-analyzer not running (see `rustup component add rust-analyzer`)")?;
-        let uri = self
-            .buffer_uri
-            .as_ref()
-            .context("buffer has no file URI; cannot query LSP")?
-            .clone();
+        let workspace_edit = lsp.rename(&request_uri, line, character, &new_name)?;
 
-        let workspace_edit = lsp.rename(&uri, line, character, &new_name)?;
-        let mut in_buffer = workspace_edit
-            .changes
-            .get(&uri)
-            .cloned()
-            .unwrap_or_default();
-        let skipped_files: Vec<String> = workspace_edit
-            .changes
-            .keys()
-            .filter(|k| **k != uri)
-            .cloned()
+        let uri_to_bid: HashMap<String, u64> = self
+            .buffers
+            .values()
+            .filter_map(|e| e.uri.as_ref().map(|u| (u.clone(), e.id)))
             .collect();
 
-        if in_buffer.is_empty() {
-            return Ok(RenameResult {
-                applied: 0,
-                new_version: self.buffer.version(),
-                skipped_files,
-            });
+        let mut applied = Vec::new();
+        let mut skipped_files = Vec::new();
+        let mut affected_ids: Vec<u64> = Vec::new();
+
+        for (edit_uri, edits) in &workspace_edit.changes {
+            match uri_to_bid.get(edit_uri) {
+                Some(&bid) => {
+                    let mut sorted = edits.clone();
+                    sorted.sort_by(|a, b| {
+                        (
+                            b.range.start.line,
+                            b.range.start.character,
+                            b.range.end.line,
+                            b.range.end.character,
+                        )
+                            .cmp(&(
+                                a.range.start.line,
+                                a.range.start.character,
+                                a.range.end.line,
+                                a.range.end.character,
+                            ))
+                    });
+                    let intent = format!("edit.rename_symbol -> {new_name}");
+                    let sorted_for_body = sorted.clone();
+                    self.with_auto_tx_on(bid, intent, move |entry| {
+                        apply_text_edits(&mut entry.buffer, &sorted_for_body)
+                    })?;
+                    affected_ids.push(bid);
+                    let entry = self.buffer_entry(bid)?;
+                    applied.push(RenameApplied {
+                        buffer_id: bid,
+                        uri: edit_uri.clone(),
+                        edits: sorted.len(),
+                        new_version: entry.buffer.version(),
+                    });
+                }
+                None => skipped_files.push(edit_uri.clone()),
+            }
         }
 
-        // Apply end-to-start so earlier edits don't shift later ranges.
-        in_buffer.sort_by(|a, b| {
-            (
-                b.range.start.line,
-                b.range.start.character,
-                b.range.end.line,
-                b.range.end.character,
-            )
-                .cmp(&(
-                    a.range.start.line,
-                    a.range.start.character,
-                    a.range.end.line,
-                    a.range.end.character,
-                ))
-        });
-
-        let edits_for_intent = in_buffer.clone();
-        self.with_auto_tx(
-            || format!("edit.rename_symbol -> {new_name}"),
-            move |s| apply_text_edits(&mut s.buffer, &edits_for_intent),
-        )?;
-        self.refresh_syntax();
-        self.notify_lsp_changed();
-
+        for bid in affected_ids {
+            self.refresh_syntax(bid);
+            self.notify_lsp_changed(bid);
+        }
+        // Sort for stable output.
+        applied.sort_by_key(|a| a.buffer_id);
+        skipped_files.sort();
         Ok(RenameResult {
-            applied: in_buffer.len(),
-            new_version: self.buffer.version(),
+            applied,
             skipped_files,
         })
     }
 
     // ---------- Read-only accessors (for tests + transport) ----------
 
-    #[allow(dead_code)] // Used by tests; an MCP `buffer.version` tool can wrap it later.
-    pub fn buffer_version(&self) -> u64 {
-        self.buffer.version()
+    #[allow(dead_code)] // Used by tests; an MCP `buffer.version` wrapper can land later.
+    pub fn buffer_version(&self, buffer_id: u64) -> Result<u64> {
+        Ok(self.buffer_entry(buffer_id)?.buffer.version())
+    }
+
+    #[allow(dead_code)]
+    pub fn focus(&self) -> Option<u64> {
+        self.focus
     }
 
     // ---------- Internals ----------
 
-    fn check_buffer(&self, buffer_id: u64) -> Result<()> {
-        if buffer_id != SOLE_BUFFER_ID {
-            return Err(anyhow!(
-                "unknown buffer_id {} (only {} is hosted)",
-                buffer_id,
-                SOLE_BUFFER_ID
-            ));
-        }
-        Ok(())
+    fn buffer_entry(&self, buffer_id: u64) -> Result<&BufferEntry> {
+        self.buffers
+            .get(&buffer_id)
+            .ok_or_else(|| anyhow!("unknown buffer_id {}", buffer_id))
     }
 
-    fn check_version(&self, version: u64) -> Result<()> {
-        if self.buffer.version() != version {
+    fn check_version(&self, buffer_id: u64, version: u64) -> Result<()> {
+        let entry = self.buffer_entry(buffer_id)?;
+        if entry.buffer.version() != version {
             return Err(anyhow!(
-                "version mismatch: buffer is at {}, caller sent {}",
-                self.buffer.version(),
+                "version mismatch: buffer {} is at {}, caller sent {}",
+                buffer_id,
+                entry.buffer.version(),
                 version
             ));
         }
         Ok(())
     }
 
-    /// Run `body` under either the caller's explicit transaction or an
-    /// auto-tx with `intent_fn` as its intent. On error the auto-tx is
-    /// rolled back; on success it commits. The explicit-tx path is left
-    /// to the caller to close.
-    fn with_auto_tx<F, I>(&mut self, intent_fn: I, body: F) -> Result<()>
-    where
-        F: FnOnce(&mut Self) -> Result<()>,
-        I: FnOnce() -> String,
-    {
-        if self.explicit_tx.is_some() {
-            return body(self);
+    fn tx_buffer_for(&self, tx_id: TxId) -> Result<u64> {
+        match self.explicit_tx {
+            Some((open_tx, bid)) if open_tx == tx_id => Ok(bid),
+            _ => Err(anyhow!(
+                "tx_id {:?} is not the currently open transaction",
+                tx_id
+            )),
         }
-        let tx_id = self
-            .tx_manager
-            .begin(intent_fn(), None, &self.buffer);
-        match body(self) {
+    }
+
+    /// Run `body` inside a per-buffer transaction. If an explicit
+    /// transaction is open *for the same buffer*, the body joins it;
+    /// otherwise an auto-tx wraps the body and commits / rolls back
+    /// based on the body's result.
+    fn with_auto_tx_on<F>(
+        &mut self,
+        buffer_id: u64,
+        intent: String,
+        body: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut BufferEntry) -> Result<()>,
+    {
+        let join_explicit = matches!(self.explicit_tx, Some((_, b)) if b == buffer_id);
+        if join_explicit {
+            let entry = self
+                .buffers
+                .get_mut(&buffer_id)
+                .ok_or_else(|| anyhow!("unknown buffer_id {}", buffer_id))?;
+            return body(entry);
+        }
+        let tx_id = {
+            let entry = self
+                .buffers
+                .get(&buffer_id)
+                .ok_or_else(|| anyhow!("unknown buffer_id {}", buffer_id))?;
+            self.tx_manager.begin(intent, None, &entry.buffer)
+        };
+        let body_result = {
+            let entry = self
+                .buffers
+                .get_mut(&buffer_id)
+                .ok_or_else(|| anyhow!("unknown buffer_id {}", buffer_id))?;
+            body(entry)
+        };
+        match body_result {
             Ok(()) => {
-                self.tx_manager.commit(tx_id, &self.buffer)?;
+                let entry = self
+                    .buffers
+                    .get(&buffer_id)
+                    .expect("buffer was just modified inside the tx");
+                self.tx_manager.commit(tx_id, &entry.buffer)?;
                 Ok(())
             }
             Err(e) => {
-                let _ = self.tx_manager.rollback(tx_id, &mut self.buffer);
+                if let Some(entry) = self.buffers.get_mut(&buffer_id) {
+                    let _ = self.tx_manager.rollback(tx_id, &mut entry.buffer);
+                }
                 Err(e)
             }
         }
     }
 
-    fn refresh_syntax(&mut self) {
-        if let Some(syn) = self.syntax.as_mut() {
-            syn.refresh(&mut self.buffer);
+    fn refresh_syntax(&mut self, buffer_id: u64) {
+        if let Some(entry) = self.buffers.get_mut(&buffer_id)
+            && let Some(syn) = entry.syntax.as_mut()
+        {
+            syn.refresh(&mut entry.buffer);
         }
     }
 
-    fn notify_lsp_changed(&mut self) {
-        if let (Some(lsp), Some(uri)) = (self.lsp.as_ref(), self.buffer_uri.as_ref()) {
-            self.lsp_version += 1;
-            let text = self.buffer.rope().to_string();
-            // Best-effort: an LSP I/O error doesn't fail the edit.
-            let _ = lsp.did_change(uri, self.lsp_version, &text);
+    fn notify_lsp_changed(&mut self, buffer_id: u64) {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return;
+        };
+        let Some(entry) = self.buffers.get_mut(&buffer_id) else {
+            return;
+        };
+        let Some(uri) = entry.uri.as_ref() else {
+            return;
+        };
+        entry.lsp_version += 1;
+        let text = entry.buffer.rope().to_string();
+        let _ = lsp.did_change(uri, entry.lsp_version, &text);
+    }
+
+    fn ensure_lsp_or_open(&mut self, path: &Path, uri: &str, text: &str) {
+        if let Some(lsp) = self.lsp.as_ref() {
+            // Already spawned — just register the new file.
+            let _ = lsp.did_open(uri, "rust", text);
+            return;
+        }
+        let workspace = lsp::workspace_root_for(path);
+        match LspClient::spawn_rust(&workspace, uri, text) {
+            Ok(client) => {
+                self.lsp = Some(client);
+                self.workspace_root = Some(workspace);
+            }
+            Err(e) => {
+                eprintln!("dyad: LSP disabled ({e})");
+            }
         }
     }
 }
 
 /// Apply a list of LSP `TextEdit`s to a buffer. Caller is responsible
-/// for sorting the edits end-to-start so earlier indices stay valid
-/// (we don't sort here so the caller's intent — including pre-sorted
-/// inputs from tests — is preserved).
+/// for sorting the edits end-to-start so earlier indices stay valid.
 fn apply_text_edits(buffer: &mut Buffer, edits: &[TextEdit]) -> Result<()> {
     for edit in edits {
         let start = lsp_pos_to_char(buffer, edit.range.start.line, edit.range.start.character)?;
@@ -490,7 +660,7 @@ fn apply_text_edits(buffer: &mut Buffer, edits: &[TextEdit]) -> Result<()> {
 /// Convert an LSP `(line, character)` position into a rope char index.
 /// LSP characters are UTF-16 code units in the spec; we treat them as
 /// rope chars, which is exact for BMP-only source and off-by-one per
-/// non-BMP code point otherwise (see `edit_rename_symbol`'s doc).
+/// non-BMP code point otherwise.
 fn lsp_pos_to_char(buffer: &Buffer, line: u32, character: u32) -> Result<usize> {
     let line = line as usize;
     let character = character as usize;
@@ -514,31 +684,6 @@ fn lsp_pos_to_char(buffer: &Buffer, line: u32, character: u32) -> Result<usize> 
     Ok(line_start + character)
 }
 
-/// Try to spawn rust-analyzer for the buffer's file. Returns
-/// `(Some(client), Some(uri))` on success, `(None, Some(uri))` if the
-/// file exists but rust-analyzer couldn't start, and `(None, None)`
-/// when the buffer is unsaved / pathless. Failures log to stderr and
-/// degrade gracefully — the protocol still serves non-LSP tools.
-fn try_spawn_lsp(buffer: &Buffer) -> (Option<LspClient>, Option<String>) {
-    let Some(path) = buffer.path() else {
-        return (None, None);
-    };
-    let uri = lsp::path_to_uri(path);
-    if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-        return (None, Some(uri));
-    }
-    let workspace = lsp::workspace_root_for(path);
-    let text = buffer.rope().to_string();
-    match LspClient::spawn_rust(&workspace, &uri, &text) {
-        Ok(client) => (Some(client), Some(uri)),
-        Err(e) => {
-            eprintln!("dyad: LSP disabled ({e})");
-            (None, Some(uri))
-        }
-    }
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,8 +693,7 @@ mod tests {
             .join(format!("dyad_proto_{}_{}.rs", name, std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut state = ProtocolState::open(path).unwrap();
-        // Seed with one function so ast.query has something to chew on.
-        let v0 = state.buffer.version();
+        let v0 = state.buffer_version(SOLE_BUFFER_ID).unwrap();
         state
             .edit_replace_range(
                 SOLE_BUFFER_ID,
@@ -559,6 +703,10 @@ mod tests {
             )
             .unwrap();
         state
+    }
+
+    fn text_of(state: &ProtocolState, id: u64) -> String {
+        state.buffer_read(id, None).unwrap().text
     }
 
     #[test]
@@ -584,7 +732,7 @@ mod tests {
     #[test]
     fn edit_replace_range_requires_matching_version() {
         let mut state = scratch_state("version_check");
-        let stale = state.buffer_version() + 1;
+        let stale = state.buffer_version(SOLE_BUFFER_ID).unwrap() + 1;
         let err = state
             .edit_replace_range(
                 SOLE_BUFFER_ID,
@@ -623,7 +771,7 @@ mod tests {
             )
             .unwrap();
         let target = matches.into_iter().find(|m| m.capture == "name").unwrap();
-        let v = state.buffer_version();
+        let v = state.buffer_version(SOLE_BUFFER_ID).unwrap();
         state
             .edit_replace_node(
                 SOLE_BUFFER_ID,
@@ -635,17 +783,16 @@ mod tests {
                 "farewell",
             )
             .unwrap();
-        let read = state.buffer_read(SOLE_BUFFER_ID, None).unwrap();
-        assert_eq!(read.text, "fn farewell() {}\n");
+        assert_eq!(text_of(&state, SOLE_BUFFER_ID), "fn farewell() {}\n");
     }
 
     #[test]
     fn explicit_tx_commit_creates_one_history_entry_for_two_edits() {
         let mut state = scratch_state("explicit_tx");
         let tx_id = state
-            .tx_begin("multi-edit refactor".to_string(), None)
+            .tx_begin(SOLE_BUFFER_ID, "multi-edit refactor".to_string(), None)
             .unwrap();
-        let v1 = state.buffer_version();
+        let v1 = state.buffer_version(SOLE_BUFFER_ID).unwrap();
         state
             .edit_replace_range(
                 SOLE_BUFFER_ID,
@@ -654,8 +801,8 @@ mod tests {
                 "// intro\n",
             )
             .unwrap();
-        let v2 = state.buffer_version();
-        let end = state.buffer.rope().len_chars();
+        let v2 = state.buffer_version(SOLE_BUFFER_ID).unwrap();
+        let end = text_of(&state, SOLE_BUFFER_ID).chars().count();
         state
             .edit_replace_range(
                 SOLE_BUFFER_ID,
@@ -682,10 +829,6 @@ mod tests {
         let mut buf = Buffer::open(path).unwrap();
         buf.insert_str(0, "fn old() { let old = 1; }\n");
 
-        // Two occurrences of `old`: at chars 3..6 and chars 15..18.
-        // LSP positions on line 0: characters 3..6 and 15..18.
-        // We pass them already sorted end-to-start the way
-        // edit_rename_symbol would.
         let edits = vec![
             TextEdit {
                 range: Range {
@@ -713,20 +856,19 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut buf = Buffer::open(path).unwrap();
         buf.insert_str(0, "ab\ncde\n");
-        // line 0, char 1 -> rope char 1 ('b')
         assert_eq!(lsp_pos_to_char(&buf, 0, 1).unwrap(), 1);
-        // line 1, char 2 -> rope char 5 ('e')
         assert_eq!(lsp_pos_to_char(&buf, 1, 2).unwrap(), 5);
-        // out of range line errors.
         assert!(lsp_pos_to_char(&buf, 9, 0).is_err());
     }
 
     #[test]
     fn tx_rollback_restores_buffer_and_invalidates_syntax() {
         let mut state = scratch_state("rollback");
-        let pre_text = state.buffer_read(SOLE_BUFFER_ID, None).unwrap().text;
-        let tx_id = state.tx_begin("doomed".to_string(), None).unwrap();
-        let v = state.buffer_version();
+        let pre_text = text_of(&state, SOLE_BUFFER_ID);
+        let tx_id = state
+            .tx_begin(SOLE_BUFFER_ID, "doomed".to_string(), None)
+            .unwrap();
+        let v = state.buffer_version(SOLE_BUFFER_ID).unwrap();
         state
             .edit_replace_range(
                 SOLE_BUFFER_ID,
@@ -736,11 +878,7 @@ mod tests {
             )
             .unwrap();
         state.tx_rollback(tx_id).unwrap();
-        let read = state.buffer_read(SOLE_BUFFER_ID, None).unwrap();
-        assert_eq!(read.text, pre_text);
-        // ast.query must still work after the rollback — proves the
-        // syntax tree was invalidated and re-parsed against the restored
-        // rope.
+        assert_eq!(text_of(&state, SOLE_BUFFER_ID), pre_text);
         let matches = state
             .ast_query(
                 SOLE_BUFFER_ID,
@@ -748,5 +886,71 @@ mod tests {
             )
             .unwrap();
         assert!(matches.iter().any(|m| m.capture == "name"));
+    }
+
+    // ---------- Phase 8 multi-buffer ----------
+
+    #[test]
+    fn buffer_open_returns_ascending_ids_and_list_reflects_them() {
+        let mut state = scratch_state("multi_open");
+        let path_b = std::env::temp_dir()
+            .join(format!("dyad_proto_multi_open_b_{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&path_b);
+        let id_b = state.buffer_open(path_b).unwrap();
+        let path_c = std::env::temp_dir()
+            .join(format!("dyad_proto_multi_open_c_{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&path_c);
+        let id_c = state.buffer_open(path_c).unwrap();
+
+        assert_eq!(id_b, 2);
+        assert_eq!(id_c, 3);
+        let ids: Vec<u64> = state.buffer_list().iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(state.focus(), Some(id_c));
+    }
+
+    #[test]
+    fn buffer_close_removes_entry_and_shifts_focus() {
+        let mut state = scratch_state("multi_close");
+        let path_b = std::env::temp_dir()
+            .join(format!("dyad_proto_multi_close_b_{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&path_b);
+        let id_b = state.buffer_open(path_b).unwrap();
+        assert_eq!(state.focus(), Some(id_b));
+
+        state.buffer_close(id_b).unwrap();
+        assert_eq!(state.focus(), Some(SOLE_BUFFER_ID));
+        assert_eq!(state.buffer_list().len(), 1);
+
+        // Closing the last buffer leaves focus None.
+        state.buffer_close(SOLE_BUFFER_ID).unwrap();
+        assert_eq!(state.focus(), None);
+        assert!(state.buffer_list().is_empty());
+    }
+
+    #[test]
+    fn clients_list_returns_the_mcp_session() {
+        let state = scratch_state("clients");
+        let clients = state.clients_list();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].kind, "agent");
+        assert_eq!(clients[0].focus, Some(SOLE_BUFFER_ID));
+    }
+
+    #[test]
+    fn edits_are_isolated_per_buffer() {
+        let mut state = scratch_state("isolated");
+        let path_b = std::env::temp_dir()
+            .join(format!("dyad_proto_isolated_b_{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&path_b);
+        let id_b = state.buffer_open(path_b).unwrap();
+        let v_b = state.buffer_version(id_b).unwrap();
+        state
+            .edit_replace_range(id_b, v_b, CharRange { start: 0, end: 0 }, "fn other() {}\n")
+            .unwrap();
+
+        // Buffer 1 still has its original text; buffer id_b has its own.
+        assert_eq!(text_of(&state, SOLE_BUFFER_ID), "fn hello() {}\n");
+        assert_eq!(text_of(&state, id_b), "fn other() {}\n");
     }
 }

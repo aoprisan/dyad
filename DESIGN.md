@@ -193,18 +193,25 @@ cargo build --release && scripts/mcp-smoke.sh
 ```
 
 Known scope limits in this iteration:
-- One buffer per `--mcp` invocation; `buffer.open` is implicit from the
-  CLI path.
+- The CLI path opens the first buffer (id 1). Open more in the same
+  session via `buffer.open`; close with `buffer.close`. One shared
+  rust-analyzer is reused across every `.rs` buffer in the same
+  workspace.
 - `symbol.definition`, `diag.current`, and `edit.rename_symbol`
   require `rust-analyzer` on `PATH`. Install with `rustup component
   add rust-analyzer` (or `brew install rust-analyzer`). Without it
   the LSP tools return an error but every other tool still works.
-- `edit.rename_symbol` only applies edits to the buffer currently
-  open by this `--mcp` invocation. Cross-file rename targets come
-  back in `skipped_files`; re-run dyad against each file (or wait for
-  Phase 8 multi-buffer) to apply them. LSP positions are line +
-  UTF-16 code units — exact for BMP-only source, off-by-one per
-  non-BMP code point.
+- `edit.rename_symbol` applies to every buffer the workspace edit
+  touches that's currently loaded; URIs not loaded come back in
+  `skipped_files` for the agent to `buffer.open` and retry. The
+  rename runs a *per-buffer* auto-transaction, so true cross-buffer
+  atomicity isn't there yet — a follow-up needs cross-buffer
+  transactions. LSP positions are line + UTF-16 code units, exact
+  for BMP-only source.
+- `clients.list` returns just this MCP session for now. A concurrent
+  TUI + MCP client list (with cursor focus) needs a daemon split of
+  the editor; `clients.cursor` and `clients.subscribe_edits` need
+  streaming notifications and aren't wired yet.
 - No `view.*`, `symbol.references`, `symbol.signature`,
   `edit.extract_function`, `edit.add_import`, `edit.inline`, or
   `note.pin` yet.
