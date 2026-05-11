@@ -3,7 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::App;
+use crate::app::{App, GitFile, GitGroup, GitView, HistoryView};
 use crate::git::LineStatus;
 use crate::syntax::{self, HighlightSpan};
 use crate::theme;
@@ -44,10 +44,20 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if let Some(rect) = tree_rect {
         render_tree(frame, rect, &mut app.tree);
     }
-    render_gutter(frame, gutter_rect, app, gutter_width);
-    render_text(frame, text_rect, app);
+    // Overlays take over the editor area (gutter + text) when open
+    // so the user can scroll long content without fighting the syntax
+    // viewport. Tree sidebar stays visible alongside if open. History
+    // beats diff if somehow both got opened (they shouldn't).
+    if app.history.is_some() {
+        render_history(frame, editor_area, app);
+    } else if app.diff.is_some() {
+        render_diff(frame, editor_area, app);
+    } else {
+        render_gutter(frame, gutter_rect, app, gutter_width);
+        render_text(frame, text_rect, app);
+    }
     render_status(frame, status_area, app);
-    if !app.tree.focused {
+    if app.diff.is_none() && app.history.is_none() && !app.tree.focused {
         place_cursor(frame, text_rect, app);
     }
 }
@@ -96,6 +106,207 @@ fn render_tree(frame: &mut Frame, rect: Rect, tree: &mut FileTree) {
         lines.push(Line::from(Span::styled(text, style)));
     }
     frame.render_widget(Paragraph::new(lines).style(theme::tree()), rect);
+}
+
+fn render_diff(frame: &mut Frame, rect: Rect, app: &App) {
+    let Some(view) = app.diff.as_ref() else { return };
+    // Two-pane horizontal layout: change-list on the left, diff on
+    // the right. The change-list is sized to the longest entry's
+    // rough width, clamped to keep the diff readable.
+    let list_width = 36u16.min(rect.width.saturating_sub(20));
+    let split = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(list_width), Constraint::Min(1)])
+        .split(rect);
+    render_git_files(frame, split[0], view);
+    render_git_diff(frame, split[1], view);
+}
+
+fn render_git_files(frame: &mut Frame, rect: Rect, view: &GitView) {
+    let width = rect.width as usize;
+    let viewport = rect.height as usize;
+
+    // Build the row list once (headers interleaved with file rows),
+    // then page it against the cursor so the selection stays visible.
+    enum Row<'a> {
+        Header(GitGroup),
+        File(&'a GitFile, usize), // file + its index in view.files
+    }
+    let mut rows: Vec<Row<'_>> = Vec::new();
+    let mut last_group: Option<GitGroup> = None;
+    for (i, f) in view.files.iter().enumerate() {
+        if last_group != Some(f.group) {
+            rows.push(Row::Header(f.group));
+            last_group = Some(f.group);
+        }
+        rows.push(Row::File(f, i));
+    }
+    // Find the row index of the selected file so we can scroll into view.
+    let cursor_row = rows
+        .iter()
+        .position(|r| matches!(r, Row::File(_, i) if *i == view.cursor))
+        .unwrap_or(0);
+    let top = scroll_top(cursor_row, viewport, rows.len());
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport);
+    for r in 0..viewport {
+        let idx = top + r;
+        match rows.get(idx) {
+            None => lines.push(Line::raw("")),
+            Some(Row::Header(g)) => {
+                let text = truncate_to(&format!(" {} ", g.header()), width);
+                lines.push(Line::from(Span::styled(text, theme::status_hint())));
+            }
+            Some(Row::File(f, i)) => {
+                let marker = format!("{}{}", f.staged, f.unstaged);
+                let raw = format!(" {} {}", marker, f.path.display());
+                let text = truncate_to(&raw, width);
+                let style = if *i == view.cursor {
+                    theme::tree_selected()
+                } else {
+                    git_status_style(f.staged, f.unstaged)
+                };
+                lines.push(Line::from(Span::styled(text, style)));
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).style(theme::tree()), rect);
+}
+
+fn render_git_diff(frame: &mut Frame, rect: Rect, view: &GitView) {
+    let viewport = rect.height as usize;
+    let width = rect.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport);
+    for r in 0..viewport {
+        let idx = view.diff_scroll + r;
+        let Some(raw) = view.diff_lines.get(idx) else {
+            lines.push(Line::raw(""));
+            continue;
+        };
+        let text = truncate_to(raw, width);
+        let style = diff_line_style(raw);
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    frame.render_widget(Paragraph::new(lines).style(theme::editor()), rect);
+}
+
+fn render_history(frame: &mut Frame, rect: Rect, app: &App) {
+    let Some(view) = app.history.as_ref() else { return };
+    let list_width = 48u16.min(rect.width.saturating_sub(20));
+    let split = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(list_width), Constraint::Min(1)])
+        .split(rect);
+    render_history_list(frame, split[0], view);
+    render_history_show(frame, split[1], view);
+}
+
+fn render_history_list(frame: &mut Frame, rect: Rect, view: &HistoryView) {
+    let viewport = rect.height as usize;
+    let width = rect.width as usize;
+    let top = scroll_top(view.cursor, viewport, view.entries.len());
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport);
+    for r in 0..viewport {
+        let idx = top + r;
+        let Some(entry) = view.entries.get(idx) else {
+            lines.push(Line::raw(""));
+            continue;
+        };
+        // `<short_sha> <date> <author> <subject>` — the author column
+        // is clamped so long names don't crowd out the subject.
+        let author = truncate_to(&entry.author, 10);
+        let text = truncate_to(
+            &format!(
+                " {} {} {:<10} {}",
+                entry.short_sha, entry.date, author, entry.subject
+            ),
+            width,
+        );
+        let style = if idx == view.cursor {
+            theme::tree_selected()
+        } else {
+            theme::tree()
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    frame.render_widget(Paragraph::new(lines).style(theme::tree()), rect);
+}
+
+fn render_history_show(frame: &mut Frame, rect: Rect, view: &HistoryView) {
+    let viewport = rect.height as usize;
+    let width = rect.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport);
+    for r in 0..viewport {
+        let idx = view.commit_scroll + r;
+        let Some(raw) = view.commit_lines.get(idx) else {
+            lines.push(Line::raw(""));
+            continue;
+        };
+        let text = truncate_to(raw, width);
+        // `git show` output mixes header lines ("commit ...", "Author: …",
+        // "Date: …") with a diff body. Diff-line coloring applies to the
+        // body; the header gets a muted accent so it doesn't compete.
+        let style = if raw.starts_with("commit ")
+            || raw.starts_with("Author:")
+            || raw.starts_with("Date:")
+            || raw.starts_with("Merge:")
+        {
+            theme::status_hint()
+        } else {
+            diff_line_style(raw)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    frame.render_widget(Paragraph::new(lines).style(theme::editor()), rect);
+}
+
+/// Pick a top-row offset so the selection sits comfortably inside
+/// the viewport — same idea as `View::scroll_into_view` but for the
+/// virtual row index that includes headers.
+fn scroll_top(cursor_row: usize, viewport: usize, total_rows: usize) -> usize {
+    if viewport == 0 || total_rows <= viewport {
+        return 0;
+    }
+    if cursor_row < viewport {
+        0
+    } else {
+        (cursor_row + 1).saturating_sub(viewport)
+    }
+}
+
+/// Colour the file row by its working-tree state — added green,
+/// modified yellow, deleted red, untracked muted. Mirrors the
+/// gutter palette so the two views read consistently.
+fn git_status_style(staged: char, unstaged: char) -> ratatui::style::Style {
+    use ratatui::style::Style;
+    let pick = if unstaged != ' ' { unstaged } else { staged };
+    let base = Style::default();
+    match pick {
+        'A' => base.fg(theme::ok()),
+        'M' => base.fg(theme::warn()),
+        'D' => base.fg(theme::error()),
+        '?' => base.fg(theme::diagnostic(Some(4))), // hint / violet
+        _ => theme::tree(),
+    }
+}
+
+/// Map a diff-line prefix to a Solarized color. Unprefixed context
+/// lines render with the default editor style.
+fn diff_line_style(line: &str) -> ratatui::style::Style {
+    use ratatui::style::Style;
+    let base = Style::default();
+    if line.starts_with("@@") {
+        base.fg(theme::diagnostic(Some(3))) // info / cyan
+    } else if line.starts_with("+++") || line.starts_with("---") {
+        base.fg(theme::diagnostic(Some(4))) // hint / violet — file headers
+    } else if line.starts_with('+') {
+        base.fg(theme::ok())
+    } else if line.starts_with('-') {
+        base.fg(theme::error())
+    } else {
+        theme::editor()
+    }
 }
 
 fn truncate_to(s: &str, width: usize) -> String {
@@ -221,6 +432,19 @@ fn build_line(chars: &[char], spans: &[HighlightSpan]) -> Line<'static> {
 }
 
 fn render_status(frame: &mut Frame, rect: Rect, app: &App) {
+    // Prompt takes over the entire status bar when active — it's the
+    // user's only interaction surface, so any background text would
+    // just be noise.
+    if let Some(prompt) = app.prompt.as_ref() {
+        let bar = theme::status_bar();
+        let text = format!(" {} {}_", prompt.label, prompt.buffer);
+        let total_width = rect.width as usize;
+        let pad = total_width.saturating_sub(text.chars().count());
+        let mut spans = vec![Span::styled(text, bar)];
+        spans.push(Span::styled(" ".repeat(pad), bar));
+        frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+        return;
+    }
     let path = match app.buffer.path() {
         Some(p) => p.display().to_string(),
         None => "[scratch]".into(),
@@ -240,6 +464,10 @@ fn render_status(frame: &mut Frame, rect: Rect, app: &App) {
     } else if let Some((label, severity)) = current_line_diagnostic(app) {
         let style = theme::status_bar().fg(theme::diagnostic(severity));
         (label, style)
+    } else if app.history.is_some() {
+        (HISTORY_HINT_TEXT.to_string(), hint)
+    } else if app.diff.is_some() {
+        (DIFF_HINT_TEXT.to_string(), hint)
     } else if app.tree.focused {
         (TREE_HINT_TEXT.to_string(), hint)
     } else {
@@ -249,12 +477,27 @@ fn render_status(frame: &mut Frame, rect: Rect, app: &App) {
     // LSP badge sits between the left segment and the padding. Hidden for
     // non-Rust files; green when alive; red when we tried and failed.
     let lsp_badge = lsp_badge_span(app);
+    let autosave_badge = if app.autosave {
+        Some(Span::styled(
+            "auto ",
+            theme::status_bar().fg(theme::ok()),
+        ))
+    } else {
+        None
+    };
 
     let total_width = rect.width as usize;
-    let badge_len = lsp_badge.as_ref().map(|s| s.content.chars().count()).unwrap_or(0);
+    let badge_len = lsp_badge.as_ref().map(|s| s.content.chars().count()).unwrap_or(0)
+        + autosave_badge
+            .as_ref()
+            .map(|s| s.content.chars().count())
+            .unwrap_or(0);
     let combined_len = left.chars().count() + badge_len + right_text.chars().count();
     let pad = total_width.saturating_sub(combined_len);
     let mut spans = vec![Span::styled(left, bar)];
+    if let Some(badge) = autosave_badge {
+        spans.push(badge);
+    }
     if let Some(badge) = lsp_badge {
         spans.push(badge);
     }
@@ -284,10 +527,16 @@ fn lsp_badge_span(app: &App) -> Option<Span<'static>> {
 }
 
 const HINT_TEXT: &str =
-    " Ctrl-T tree · Ctrl-S save · Ctrl-G def · Ctrl-O back · Ctrl-Q quit ";
+    " Ctrl-T tree · Ctrl-N new · Ctrl-R git · Ctrl-S save · Ctrl-Q quit ";
 
 const TREE_HINT_TEXT: &str =
     " ↑/↓ move · Enter open · Esc close · Ctrl-T toggle ";
+
+const DIFF_HINT_TEXT: &str =
+    " ↑/↓ file · s stage · u unstage · c commit · Ctrl-U/D page · Esc close ";
+
+const HISTORY_HINT_TEXT: &str =
+    " ↑/↓ commit · Ctrl-U/D page · Esc close · Ctrl-L toggle ";
 
 /// First LSP diagnostic that starts on the cursor line, formatted for
 /// the status bar. Returns `(text, severity)` so the caller can colorize.

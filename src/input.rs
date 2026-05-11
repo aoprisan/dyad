@@ -48,6 +48,31 @@ pub fn map(ev: KeyEvent) -> Option<Action> {
                     'o' => Some(Action::GoBack),
                     // Ctrl-T toggles the file-tree sidebar.
                     't' => Some(Action::ToggleTree),
+                    // Page up/down for keyboards without dedicated
+                    // PageUp/PageDown keys (e.g. MacBook). Mnemonic
+                    // mirrors vim's Ctrl-U/Ctrl-D scroll bindings.
+                    'u' => Some(Action::PageUp),
+                    'd' => Some(Action::PageDown),
+                    // Word jumping under Ctrl too, alongside Alt+b/f,
+                    // so the user doesn't have to switch modifiers.
+                    // Readline convention: b = back, f = forward.
+                    'b' => Some(Action::MoveWordLeft),
+                    'f' => Some(Action::MoveWordRight),
+                    // Readline convention: a = start of line, e = end.
+                    'a' => Some(Action::MoveHome),
+                    'e' => Some(Action::MoveEnd),
+                    // Ctrl-R ("review"): show the current file's diff
+                    // against HEAD in a scrollable overlay.
+                    'r' => Some(Action::ToggleGitDiff),
+                    // Ctrl-N: prompt for a filename and create it
+                    // under the tree's selected directory (or the tree
+                    // root when nothing's selected / tree is closed).
+                    'n' => Some(Action::NewFile),
+                    // Ctrl-W ("write"): toggle autosave — buffer
+                    // writes itself ~500ms after the last edit.
+                    'w' => Some(Action::ToggleAutosave),
+                    // Ctrl-L ("log"): toggle the commit-history view.
+                    'l' => Some(Action::ToggleHistory),
                     _ => None,
                 }
             } else if alt {

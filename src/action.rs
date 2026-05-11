@@ -18,5 +18,9 @@ pub enum Action {
     GoToDefinition,
     GoBack,
     ToggleTree,
+    ToggleGitDiff,
+    ToggleHistory,
+    NewFile,
+    ToggleAutosave,
     Escape,
 }

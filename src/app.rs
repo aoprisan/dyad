@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event};
@@ -48,6 +48,91 @@ pub struct App {
     /// without the App needing to know about lazy initialization.
     /// `tree.focused` doubles as the visibility flag.
     pub tree: FileTree,
+    /// Toggle for autosave (Ctrl-W). When on, the buffer is written
+    /// ~500ms after the last edit — see `autosave_debounce` and
+    /// `maybe_autosave`. Scratch buffers (no path) are skipped.
+    pub autosave: bool,
+    /// Timestamp of the most recent buffer mutation. `maybe_autosave`
+    /// compares this against `autosave_debounce` to decide whether
+    /// enough idle time has passed to flush the file.
+    last_edit: Option<Instant>,
+    /// One-line input prompt overlaid on the status bar. `Some`
+    /// while we're collecting a filename (or any future prompted
+    /// input); routing in `apply` captures every key into the
+    /// buffer until the user hits Enter or Esc.
+    pub prompt: Option<Prompt>,
+    /// Commit-history overlay (Ctrl-L). Independent from `diff`;
+    /// has its own routing in `apply`.
+    pub history: Option<HistoryView>,
+    /// Git overlay (Ctrl-R). `Some` while the overlay is visible.
+    /// Holds the change-list, the diff for the currently-selected
+    /// file, and the repo root we resolved when the overlay opened
+    /// (so navigation doesn't re-shell `rev-parse` for every key).
+    pub diff: Option<GitView>,
+}
+
+pub struct Prompt {
+    pub label: &'static str,
+    pub buffer: String,
+    pub kind: PromptKind,
+}
+
+pub enum PromptKind {
+    /// Create a new file rooted at `parent`. The prompt buffer is
+    /// treated as a path relative to `parent`; intermediate
+    /// directories are created on confirm.
+    NewFile { parent: PathBuf },
+    /// Commit currently-staged changes in `repo_root` with the
+    /// prompt buffer as the commit message.
+    CommitMessage { repo_root: PathBuf },
+}
+
+pub struct HistoryView {
+    pub entries: Vec<git::LogEntry>,
+    pub cursor: usize,
+    pub commit_lines: Vec<String>,
+    pub commit_scroll: usize,
+    pub repo_root: PathBuf,
+}
+
+pub struct GitView {
+    pub files: Vec<GitFile>,
+    /// Index into `files` of the currently-selected entry. Changes on
+    /// Up/Down and triggers a fresh `diff_for_path` load.
+    pub cursor: usize,
+    pub diff_lines: Vec<String>,
+    pub diff_scroll: usize,
+    pub repo_root: PathBuf,
+}
+
+pub struct GitFile {
+    /// Path relative to `repo_root`.
+    pub path: PathBuf,
+    pub staged: char,
+    pub unstaged: char,
+    pub group: GitGroup,
+}
+
+/// Sections rendered in the change-list pane. Order matters: this is
+/// also the sort key (Staged first, Untracked last) so navigating
+/// Up/Down feels like scanning a `git status` from top to bottom.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GitGroup {
+    Staged,
+    Both,
+    Modified,
+    Untracked,
+}
+
+impl GitGroup {
+    pub fn header(self) -> &'static str {
+        match self {
+            GitGroup::Staged => "Staged",
+            GitGroup::Both => "Staged + Modified",
+            GitGroup::Modified => "Modified",
+            GitGroup::Untracked => "Untracked",
+        }
+    }
 }
 
 struct NavPoint {
@@ -55,6 +140,8 @@ struct NavPoint {
     line: usize,
     col: usize,
 }
+
+const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 impl App {
     pub fn new(path: PathBuf) -> Result<Self> {
@@ -88,6 +175,11 @@ impl App {
             tx_manager: TxManager::new(),
             quit_pending: false,
             tree: FileTree::new(tree_root),
+            diff: None,
+            history: None,
+            prompt: None,
+            autosave: false,
+            last_edit: None,
         })
     }
 
@@ -111,6 +203,11 @@ impl App {
             tx_manager: TxManager::new(),
             quit_pending: false,
             tree,
+            diff: None,
+            history: None,
+            prompt: None,
+            autosave: false,
+            last_edit: None,
         })
     }
 
@@ -118,8 +215,32 @@ impl App {
         while self.running {
             terminal.draw(|frame| ui::render(frame, self))?;
             self.handle_events()?;
+            self.maybe_autosave();
         }
         Ok(())
+    }
+
+    /// Idle-debounced autosave. Runs after every event-loop tick:
+    /// when the buffer is dirty, has a path, and the user hasn't
+    /// typed for at least `AUTOSAVE_DEBOUNCE`, write to disk.
+    /// Failures are silently dropped — surfacing them on every tick
+    /// would just spam the status bar; the next manual save will
+    /// produce the same error.
+    fn maybe_autosave(&mut self) {
+        if !self.autosave || !self.buffer.is_dirty() || self.buffer.path().is_none() {
+            return;
+        }
+        let Some(t) = self.last_edit else {
+            return;
+        };
+        if t.elapsed() < AUTOSAVE_DEBOUNCE {
+            return;
+        }
+        if let Ok(bytes) = self.buffer.save() {
+            self.git_status = compute_git_status(self.buffer.path());
+            self.status = format!("Autosaved {} bytes", bytes);
+            self.last_edit = None;
+        }
     }
 
     fn handle_events(&mut self) -> Result<()> {
@@ -146,22 +267,62 @@ impl App {
             self.quit_pending = false;
         }
 
-        // Tree-mode routing. Toggle / Escape are mode-independent;
-        // everything else either drives the tree or is swallowed
-        // while the sidebar holds focus, with Save/Quit explicitly
-        // passed through so the user is never locked in.
+        // Prompt takes precedence over every other mode: while the
+        // user is typing into the status-bar input we route every key
+        // there. Returns early so no buffer mutation can leak through.
+        if self.prompt.is_some() {
+            return self.drive_prompt(action);
+        }
+
+        // Modal routing. Toggles and Escape are mode-independent;
+        // anything else either drives the active modal or is swallowed
+        // while one is open. Save/Quit are explicitly passed through so
+        // the user is never locked in.
         match action {
             Action::ToggleTree => {
                 self.tree.focused = !self.tree.focused;
                 return Ok(());
             }
+            Action::ToggleGitDiff => {
+                self.toggle_git_diff();
+                return Ok(());
+            }
+            Action::ToggleHistory => {
+                self.toggle_history();
+                return Ok(());
+            }
+            Action::NewFile => {
+                self.start_new_file_prompt();
+                return Ok(());
+            }
+            Action::ToggleAutosave => {
+                self.autosave = !self.autosave;
+                self.status = if self.autosave {
+                    "Autosave on".into()
+                } else {
+                    "Autosave off".into()
+                };
+                return Ok(());
+            }
             Action::Escape => {
-                if self.tree.focused {
+                if self.history.is_some() {
+                    self.history = None;
+                } else if self.diff.is_some() {
+                    self.diff = None;
+                } else if self.tree.focused {
                     self.tree.focused = false;
                 }
                 return Ok(());
             }
             Action::Save | Action::Quit => {}
+            _ if self.history.is_some() => {
+                self.drive_history(action);
+                return Ok(());
+            }
+            _ if self.diff.is_some() => {
+                self.drive_diff(action)?;
+                return Ok(());
+            }
             _ if self.tree.focused => {
                 match action {
                     Action::MoveUp => self.tree.move_up(),
@@ -245,9 +406,14 @@ impl App {
             Action::GoBack => {
                 self.status = self.go_back();
             }
-            // Handled in the tree-routing block above; listed here so the
+            // Handled in the modal-routing block above; listed here so the
             // compiler stays happy about exhaustiveness.
-            Action::ToggleTree | Action::Escape => {}
+            Action::ToggleTree
+            | Action::ToggleGitDiff
+            | Action::ToggleHistory
+            | Action::NewFile
+            | Action::ToggleAutosave
+            | Action::Escape => {}
         }
 
         // Close out the auto-tx. If the mutation didn't actually change
@@ -261,6 +427,7 @@ impl App {
             } else {
                 self.tx_manager.commit(tx_id, &self.buffer)?;
                 self.notify_lsp_changed();
+                self.last_edit = Some(Instant::now());
             }
         }
 
@@ -370,6 +537,451 @@ impl App {
         }
     }
 
+    /// Open the New-File prompt anchored at the user's current point
+    /// in the tree (selected directory, the parent of a selected file,
+    /// or the tree root). Idempotent — pressing Ctrl-N twice doesn't
+    /// reset what the user has typed.
+    fn start_new_file_prompt(&mut self) {
+        if self.prompt.is_some() {
+            return;
+        }
+        let parent = self.new_file_parent();
+        self.prompt = Some(Prompt {
+            label: "New file:",
+            buffer: String::new(),
+            kind: PromptKind::NewFile { parent },
+        });
+    }
+
+    fn new_file_parent(&self) -> PathBuf {
+        if self.tree.focused
+            && let Some(entry) = self.tree.entries.get(self.tree.cursor)
+        {
+            if entry.is_parent_link {
+                return self.tree.root.clone();
+            }
+            if entry.is_dir {
+                return entry.path.clone();
+            }
+            if let Some(p) = entry.path.parent() {
+                return p.to_path_buf();
+            }
+        }
+        self.tree.root.clone()
+    }
+
+    fn drive_prompt(&mut self, action: Action) -> Result<()> {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return Ok(());
+        };
+        match action {
+            Action::Escape => {
+                self.prompt = None;
+            }
+            Action::Insert('\n') => {
+                let confirmed = self.prompt.take();
+                if let Some(p) = confirmed {
+                    self.confirm_prompt(p)?;
+                }
+            }
+            Action::Insert(c) if !c.is_control() => {
+                prompt.buffer.push(c);
+            }
+            Action::DeletePrev => {
+                prompt.buffer.pop();
+            }
+            // Movement / save / quit etc. are deliberately ignored while
+            // a prompt is open — keeps the input box behavior obvious.
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn confirm_prompt(&mut self, prompt: Prompt) -> Result<()> {
+        match prompt.kind {
+            PromptKind::NewFile { parent } => self.create_new_file(parent, prompt.buffer),
+            PromptKind::CommitMessage { repo_root } => self.do_commit(repo_root, prompt.buffer),
+        }
+    }
+
+    fn create_new_file(&mut self, parent: PathBuf, name: String) -> Result<()> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let candidate = Path::new(trimmed);
+        let target = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            parent.join(candidate)
+        };
+        if target.exists() {
+            self.status = format!("{} already exists", target.display());
+            return Ok(());
+        }
+        if self.buffer.is_dirty() {
+            self.status = "Save first — current buffer has unsaved changes".into();
+            return Ok(());
+        }
+        if let Some(dir) = target.parent()
+            && let Err(e) = std::fs::create_dir_all(dir)
+        {
+            self.status = format!("Could not create {}: {e}", dir.display());
+            return Ok(());
+        }
+        if let Err(e) = std::fs::File::create(&target) {
+            self.status = format!("Could not create {}: {e}", target.display());
+            return Ok(());
+        }
+        self.push_nav_stack();
+        if let Err(e) = self.open_file(&target) {
+            self.nav_stack.pop();
+            self.status = format!("Created but failed to open: {e}");
+            return Ok(());
+        }
+        self.tree.focused = false;
+        // Rebuild the tree from its current root so the new file is
+        // visible the next time the user opens the sidebar. Drops
+        // expansion state — acceptable cost for a clean view.
+        let root = self.tree.root.clone();
+        self.tree = FileTree::new(root);
+        self.status = format!("Created {}", target.display());
+        Ok(())
+    }
+
+    /// Toggle the Ctrl-R git overlay. Opening it shells out for the
+    /// repo root + `git status`, groups the change list, and loads
+    /// the diff for the first entry. An empty status (clean tree) or
+    /// missing repo surface as a status-bar message instead of an
+    /// empty overlay.
+    fn toggle_git_diff(&mut self) {
+        if self.diff.is_some() {
+            self.diff = None;
+            return;
+        }
+        // Resolve the repo root from the current buffer's file when
+        // we have one, otherwise from the tree root — either covers
+        // both `dyad <file>` and `dyad <dir>` launch modes.
+        let probe = self
+            .buffer
+            .path()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.tree.root.clone());
+        let repo_root = match git::repo_root_for(&probe) {
+            Ok(r) => r,
+            Err(e) => {
+                self.status = format!("git: {e}");
+                return;
+            }
+        };
+        let entries = match git::status_at(&repo_root) {
+            Ok(e) => e,
+            Err(e) => {
+                self.status = format!("git: {e}");
+                return;
+            }
+        };
+        let mut files = entries
+            .into_iter()
+            .map(|s| {
+                let group = classify(s.staged, s.unstaged);
+                GitFile {
+                    path: s.path,
+                    staged: s.staged,
+                    unstaged: s.unstaged,
+                    group,
+                }
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|a, b| match a.group.cmp(&b.group) {
+            std::cmp::Ordering::Equal => a.path.cmp(&b.path),
+            other => other,
+        });
+        if files.is_empty() {
+            self.status = "Working tree clean".into();
+            return;
+        }
+        let mut view = GitView {
+            files,
+            cursor: 0,
+            diff_lines: Vec::new(),
+            diff_scroll: 0,
+            repo_root,
+        };
+        load_diff_for_cursor(&mut view);
+        self.diff = Some(view);
+    }
+
+    /// Drive the git overlay. Up/Down moves between files (and
+    /// refreshes the diff pane); Ctrl-U/D (PageUp/PageDown) scrolls
+    /// the diff; Home/End jump within the file list. Letter keys
+    /// 's' / 'u' / 'c' run git commands.
+    fn drive_diff(&mut self, action: Action) -> Result<()> {
+        let Some(view) = self.diff.as_mut() else {
+            return Ok(());
+        };
+        let rows = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
+        let page = rows.saturating_sub(2).max(1) as usize;
+        let last_file = view.files.len().saturating_sub(1);
+        let last_diff = view.diff_lines.len().saturating_sub(1);
+        let mut file_changed = false;
+        match action {
+            Action::MoveUp => {
+                if view.cursor > 0 {
+                    view.cursor -= 1;
+                    file_changed = true;
+                }
+            }
+            Action::MoveDown => {
+                if view.cursor < last_file {
+                    view.cursor += 1;
+                    file_changed = true;
+                }
+            }
+            Action::MoveHome => {
+                if view.cursor != 0 {
+                    view.cursor = 0;
+                    file_changed = true;
+                }
+            }
+            Action::MoveEnd => {
+                if view.cursor != last_file {
+                    view.cursor = last_file;
+                    file_changed = true;
+                }
+            }
+            Action::PageUp => {
+                view.diff_scroll = view.diff_scroll.saturating_sub(page);
+            }
+            Action::PageDown => {
+                view.diff_scroll = (view.diff_scroll + page).min(last_diff);
+            }
+            // Single-letter commands inside the overlay. They arrive
+            // as Insert(c) because input.rs has no special tree mode;
+            // the modal-routing block above only sends Insert here
+            // when the overlay is open.
+            Action::Insert('s') => {
+                self.stage_at_cursor();
+                return Ok(());
+            }
+            Action::Insert('u') => {
+                self.unstage_at_cursor();
+                return Ok(());
+            }
+            Action::Insert('c') => {
+                self.start_commit_prompt();
+                return Ok(());
+            }
+            _ => {}
+        }
+        if file_changed {
+            view.diff_scroll = 0;
+            load_diff_for_cursor(view);
+        }
+        Ok(())
+    }
+
+    fn stage_at_cursor(&mut self) {
+        let Some(view) = self.diff.as_mut() else { return };
+        let Some(file) = view.files.get(view.cursor) else {
+            return;
+        };
+        let path = file.path.clone();
+        let repo_root = view.repo_root.clone();
+        match git::stage(&repo_root, &path) {
+            Ok(()) => {
+                self.status = format!("Staged {}", path.display());
+                self.refresh_git_view();
+            }
+            Err(e) => self.status = format!("{e}"),
+        }
+    }
+
+    fn unstage_at_cursor(&mut self) {
+        let Some(view) = self.diff.as_mut() else { return };
+        let Some(file) = view.files.get(view.cursor) else {
+            return;
+        };
+        let path = file.path.clone();
+        let repo_root = view.repo_root.clone();
+        match git::unstage(&repo_root, &path) {
+            Ok(()) => {
+                self.status = format!("Unstaged {}", path.display());
+                self.refresh_git_view();
+            }
+            Err(e) => self.status = format!("{e}"),
+        }
+    }
+
+    fn start_commit_prompt(&mut self) {
+        let Some(view) = self.diff.as_ref() else { return };
+        let repo_root = view.repo_root.clone();
+        self.prompt = Some(Prompt {
+            label: "Commit message:",
+            buffer: String::new(),
+            kind: PromptKind::CommitMessage { repo_root },
+        });
+    }
+
+    fn do_commit(&mut self, repo_root: PathBuf, message: String) -> Result<()> {
+        let msg = message.trim();
+        if msg.is_empty() {
+            self.status = "Empty commit message — aborted".into();
+            return Ok(());
+        }
+        match git::commit(&repo_root, msg) {
+            Ok(_summary) => {
+                self.status = format!("Committed: {msg}");
+                if self.diff.is_some() {
+                    self.refresh_git_view();
+                }
+                // Refresh the per-line gutter for the current file — a
+                // commit may have moved its HEAD baseline.
+                self.git_status = compute_git_status(self.buffer.path());
+            }
+            Err(e) => self.status = format!("{e}"),
+        }
+        Ok(())
+    }
+
+    /// Reload `status` after stage/unstage/commit. Keeps the cursor
+    /// pinned to the previously-selected file when it still appears
+    /// in the list; otherwise clamps to the end (so removing the last
+    /// changed file lands on what's now the last entry).
+    fn refresh_git_view(&mut self) {
+        let Some(view) = self.diff.as_mut() else { return };
+        let prev_path = view.files.get(view.cursor).map(|f| f.path.clone());
+        let repo_root = view.repo_root.clone();
+        let entries = match git::status_at(&repo_root) {
+            Ok(e) => e,
+            Err(e) => {
+                self.status = format!("git: {e}");
+                self.diff = None;
+                return;
+            }
+        };
+        if entries.is_empty() {
+            self.status = "Working tree clean".into();
+            self.diff = None;
+            return;
+        }
+        let mut files: Vec<GitFile> = entries
+            .into_iter()
+            .map(|s| GitFile {
+                group: classify(s.staged, s.unstaged),
+                path: s.path,
+                staged: s.staged,
+                unstaged: s.unstaged,
+            })
+            .collect();
+        files.sort_by(|a, b| match a.group.cmp(&b.group) {
+            std::cmp::Ordering::Equal => a.path.cmp(&b.path),
+            other => other,
+        });
+        // Try to preserve the selection by path; if the file's gone,
+        // clamp the cursor to the new tail.
+        let new_cursor = prev_path
+            .as_ref()
+            .and_then(|p| files.iter().position(|f| &f.path == p))
+            .unwrap_or_else(|| files.len().saturating_sub(1));
+        view.files = files;
+        view.cursor = new_cursor;
+        view.diff_scroll = 0;
+        load_diff_for_cursor(view);
+    }
+
+    /// Toggle the Ctrl-L history view. Closing it is fast; opening
+    /// shells out to `git log` for the last 200 commits and loads
+    /// `git show` for the newest one into the right pane.
+    fn toggle_history(&mut self) {
+        if self.history.is_some() {
+            self.history = None;
+            return;
+        }
+        let probe = self
+            .buffer
+            .path()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.tree.root.clone());
+        let repo_root = match git::repo_root_for(&probe) {
+            Ok(r) => r,
+            Err(e) => {
+                self.status = format!("git: {e}");
+                return;
+            }
+        };
+        let entries = match git::log(&repo_root, 200) {
+            Ok(e) => e,
+            Err(e) => {
+                self.status = format!("git: {e}");
+                return;
+            }
+        };
+        if entries.is_empty() {
+            self.status = "No commits yet".into();
+            return;
+        }
+        let mut view = HistoryView {
+            entries,
+            cursor: 0,
+            commit_lines: Vec::new(),
+            commit_scroll: 0,
+            repo_root,
+        };
+        load_commit_for_cursor(&mut view);
+        self.history = Some(view);
+    }
+
+    /// Drive the history overlay. Up/Down between commits refreshes
+    /// the show pane; Ctrl-U/D scrolls the show pane.
+    fn drive_history(&mut self, action: Action) {
+        let Some(view) = self.history.as_mut() else {
+            return;
+        };
+        let rows = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
+        let page = rows.saturating_sub(2).max(1) as usize;
+        let last_entry = view.entries.len().saturating_sub(1);
+        let last_show = view.commit_lines.len().saturating_sub(1);
+        let mut commit_changed = false;
+        match action {
+            Action::MoveUp => {
+                if view.cursor > 0 {
+                    view.cursor -= 1;
+                    commit_changed = true;
+                }
+            }
+            Action::MoveDown => {
+                if view.cursor < last_entry {
+                    view.cursor += 1;
+                    commit_changed = true;
+                }
+            }
+            Action::MoveHome => {
+                if view.cursor != 0 {
+                    view.cursor = 0;
+                    commit_changed = true;
+                }
+            }
+            Action::MoveEnd => {
+                if view.cursor != last_entry {
+                    view.cursor = last_entry;
+                    commit_changed = true;
+                }
+            }
+            Action::PageUp => {
+                view.commit_scroll = view.commit_scroll.saturating_sub(page);
+            }
+            Action::PageDown => {
+                view.commit_scroll = (view.commit_scroll + page).min(last_show);
+            }
+            _ => {}
+        }
+        if commit_changed {
+            view.commit_scroll = 0;
+            load_commit_for_cursor(view);
+        }
+    }
+
     /// Enter on the tree's selected entry. Directories toggle open/closed
     /// in place; the `..` row re-roots one level up; files load into the
     /// buffer and return focus to the editor. Refuses with a status
@@ -453,6 +1065,60 @@ impl App {
     }
 }
 
+/// Map a porcelain (X, Y) status pair to a display group. `?` in
+/// column X means untracked (it always pairs with `?` in Y in v1).
+fn classify(staged: char, unstaged: char) -> GitGroup {
+    if staged == '?' {
+        return GitGroup::Untracked;
+    }
+    let staged_changed = staged != ' ';
+    let unstaged_changed = unstaged != ' ';
+    match (staged_changed, unstaged_changed) {
+        (true, true) => GitGroup::Both,
+        (true, false) => GitGroup::Staged,
+        (false, true) => GitGroup::Modified,
+        // Shouldn't reach here in porcelain output (rows with both
+        // columns ' ' are unchanged and omitted), but classify as
+        // Modified to keep the entry visible if it ever does.
+        (false, false) => GitGroup::Modified,
+    }
+}
+
+/// Mirror of `load_diff_for_cursor` for the history view.
+fn load_commit_for_cursor(view: &mut HistoryView) {
+    let Some(entry) = view.entries.get(view.cursor) else {
+        view.commit_lines = Vec::new();
+        return;
+    };
+    match git::show_commit(&view.repo_root, &entry.sha) {
+        Ok(text) => {
+            view.commit_lines = text.lines().map(|l| l.to_string()).collect();
+        }
+        Err(e) => {
+            view.commit_lines = vec![format!("git show failed: {e}")];
+        }
+    }
+}
+
+/// Refresh `view.diff_lines` for the file currently under
+/// `view.cursor`. Errors stash a single one-line message into the
+/// diff so the user always sees *something* in the right pane.
+fn load_diff_for_cursor(view: &mut GitView) {
+    let Some(file) = view.files.get(view.cursor) else {
+        view.diff_lines = Vec::new();
+        return;
+    };
+    let untracked = file.group == GitGroup::Untracked;
+    match git::diff_for_path(&view.repo_root, &file.path, untracked) {
+        Ok(text) => {
+            view.diff_lines = text.lines().map(|l| l.to_string()).collect();
+        }
+        Err(e) => {
+            view.diff_lines = vec![format!("git diff failed: {e}")];
+        }
+    }
+}
+
 /// Strip the `file://` scheme and return the underlying filesystem path,
 /// `None` for any URI we can't parse trivially. (Full RFC 8089 handling
 /// can wait — rust-analyzer only emits plain `file://` URIs.)
@@ -499,6 +1165,10 @@ fn action_intent(action: &Action) -> Option<String> {
         | Action::GoToDefinition
         | Action::GoBack
         | Action::ToggleTree
+        | Action::ToggleGitDiff
+        | Action::ToggleHistory
+        | Action::NewFile
+        | Action::ToggleAutosave
         | Action::Escape => None,
     }
 }
