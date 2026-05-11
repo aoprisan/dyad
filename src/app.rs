@@ -78,6 +78,10 @@ pub struct App {
     /// visible; holds the (full) candidate list, the user's query,
     /// and the filtered match indices that drive rendering.
     pub open_file: Option<OpenFileView>,
+    /// Alt-T workspace type-search dialog. `Some` while the dialog is
+    /// visible; holds the user's query and the LSP-returned type hits
+    /// for the current query (refreshed on each keystroke).
+    pub type_search: Option<TypeSearchView>,
     /// Git overlay (Ctrl-R). `Some` while the overlay is visible.
     /// Holds the change-list, the diff for the currently-selected
     /// file, and the repo root we resolved when the overlay opened
@@ -122,6 +126,32 @@ pub struct OpenFileView {
     /// Position within `matches`; Up/Down moves this.
     pub cursor: usize,
     pub top: usize,
+}
+
+pub struct TypeSearchView {
+    /// What the user has typed so far. Each non-control char or
+    /// Backspace re-issues a `workspace/symbol` request.
+    pub query: String,
+    /// Server-returned type candidates for the current query, filtered
+    /// to type-like `SymbolKind`s (struct/enum/trait/etc). Order is
+    /// whatever rust-analyzer ranked.
+    pub results: Vec<TypeHit>,
+    /// Selection within `results`.
+    pub cursor: usize,
+    pub top: usize,
+    /// Empty-state message ("Type to search types…",
+    /// "rust-analyzer still indexing…", "No matches"). Shown only when
+    /// `results` is empty.
+    pub status: String,
+}
+
+#[derive(Clone)]
+pub struct TypeHit {
+    pub name: String,
+    pub container: Option<String>,
+    pub uri: String,
+    pub line: u32,
+    pub character: u32,
 }
 
 pub struct HistoryView {
@@ -218,6 +248,7 @@ impl App {
             history: None,
             keys_help: false,
             open_file: None,
+            type_search: None,
             prompt: None,
             autosave: false,
             last_edit: None,
@@ -249,6 +280,7 @@ impl App {
             history: None,
             keys_help: false,
             open_file: None,
+            type_search: None,
             prompt: None,
             autosave: false,
             last_edit: None,
@@ -352,6 +384,10 @@ impl App {
                 self.start_open_file_dialog();
                 return Ok(());
             }
+            Action::OpenTypeSearch => {
+                self.start_type_search_dialog();
+                return Ok(());
+            }
             Action::NewFile => {
                 self.start_new_file_prompt();
                 return Ok(());
@@ -370,6 +406,8 @@ impl App {
                     self.keys_help = false;
                 } else if self.open_file.is_some() {
                     self.open_file = None;
+                } else if self.type_search.is_some() {
+                    self.type_search = None;
                 } else if self.history.is_some() {
                     self.history = None;
                 } else if self.diff.is_some() {
@@ -392,6 +430,10 @@ impl App {
             _ if self.keys_help => return Ok(()),
             _ if self.open_file.is_some() => {
                 self.drive_open_file(action)?;
+                return Ok(());
+            }
+            _ if self.type_search.is_some() => {
+                self.drive_type_search(action)?;
                 return Ok(());
             }
             _ if self.history.is_some() => {
@@ -498,6 +540,7 @@ impl App {
             | Action::ToggleHistory
             | Action::ToggleKeysHelp
             | Action::OpenFile
+            | Action::OpenTypeSearch
             | Action::NewFile
             | Action::ToggleAutosave
             | Action::Escape => {}
@@ -730,6 +773,180 @@ impl App {
             view.top = 0;
         }
         Ok(())
+    }
+
+    /// Alt-T — pop up the workspace type-search dialog. Refuses to
+    /// open when no LSP is active for the focused buffer; the dialog
+    /// is useless without `workspace/symbol`.
+    fn start_type_search_dialog(&mut self) {
+        if self.type_search.is_some() {
+            return;
+        }
+        let Some(lsp) = self.active_lsp() else {
+            self.status = "LSP not available".into();
+            return;
+        };
+        let status = if lsp.is_indexing() {
+            format!(
+                "{} still indexing — try again in a moment",
+                lsp.language().lsp_binary()
+            )
+        } else {
+            "Type to search workspace types".to_string()
+        };
+        self.type_search = Some(TypeSearchView {
+            query: String::new(),
+            results: Vec::new(),
+            cursor: 0,
+            top: 0,
+            status,
+        });
+    }
+
+    /// Route a key into the type-search dialog. Letters/Backspace
+    /// re-issue `workspace/symbol`, arrows navigate, Enter jumps to
+    /// the selected type, Esc cancels.
+    fn drive_type_search(&mut self, action: Action) -> Result<()> {
+        let Some(view) = self.type_search.as_mut() else {
+            return Ok(());
+        };
+        let mut requery = false;
+        match action {
+            Action::Insert('\n') => {
+                let hit = view.results.get(view.cursor).cloned();
+                self.type_search = None;
+                if let Some(hit) = hit {
+                    self.jump_to_type_hit(hit);
+                }
+                return Ok(());
+            }
+            Action::Insert(c) if !c.is_control() => {
+                view.query.push(c);
+                requery = true;
+            }
+            Action::DeletePrev => {
+                if view.query.pop().is_some() {
+                    requery = true;
+                }
+            }
+            Action::MoveUp => {
+                if view.cursor > 0 {
+                    view.cursor -= 1;
+                }
+            }
+            Action::MoveDown => {
+                if view.cursor + 1 < view.results.len() {
+                    view.cursor += 1;
+                }
+            }
+            Action::MoveHome => view.cursor = 0,
+            Action::MoveEnd => {
+                if !view.results.is_empty() {
+                    view.cursor = view.results.len() - 1;
+                }
+            }
+            _ => {}
+        }
+        if requery {
+            self.refresh_type_search_results();
+        }
+        Ok(())
+    }
+
+    /// Re-run `workspace/symbol` against the dialog's current query
+    /// and store the type-filtered hits back into the view. Skips the
+    /// LSP round-trip for queries under 2 chars (rust-analyzer returns
+    /// the entire workspace at that point — useless and slow).
+    fn refresh_type_search_results(&mut self) {
+        // Snapshot what we need from the view, then drop the borrow
+        // so we can call `active_lsp` (immutable self) without overlap.
+        let Some(view) = self.type_search.as_ref() else {
+            return;
+        };
+        let query = view.query.clone();
+        if query.chars().count() < 2 {
+            if let Some(v) = self.type_search.as_mut() {
+                v.results.clear();
+                v.cursor = 0;
+                v.top = 0;
+                v.status = "Type at least 2 characters".into();
+            }
+            return;
+        }
+        let Some(lsp) = self.active_lsp() else {
+            return;
+        };
+        let indexing = lsp.is_indexing();
+        let lang_binary = lsp.language().lsp_binary();
+        let outcome = lsp.workspace_symbol(&query);
+        let Some(v) = self.type_search.as_mut() else {
+            return;
+        };
+        match outcome {
+            Ok(hits) => {
+                let types: Vec<TypeHit> = hits
+                    .into_iter()
+                    .filter(|s| is_type_kind(s.kind))
+                    .map(|s| TypeHit {
+                        name: s.name,
+                        container: s.container_name,
+                        uri: s.location.uri,
+                        line: s.location.range.start.line,
+                        character: s.location.range.start.character,
+                    })
+                    .collect();
+                v.cursor = 0;
+                v.top = 0;
+                v.status = if types.is_empty() {
+                    if indexing {
+                        format!("{lang_binary} still indexing — try again in a moment")
+                    } else {
+                        format!("No type matches for \"{query}\"")
+                    }
+                } else {
+                    String::new()
+                };
+                v.results = types;
+            }
+            Err(e) => {
+                v.results.clear();
+                v.cursor = 0;
+                v.top = 0;
+                v.status = format!("workspace/symbol failed: {e}");
+            }
+        }
+    }
+
+    /// Navigate to the location of a type-search hit. Mirrors the
+    /// cross-file branch of `go_to_definition` — same dirty-buffer
+    /// guard, same nav-stack push, same rollback on open failure.
+    fn jump_to_type_hit(&mut self, hit: TypeHit) {
+        let target_line = hit.line as usize;
+        let target_col = hit.character as usize;
+        if Some(&hit.uri) == self.lsp_uri.as_ref() {
+            self.view.goto(&self.buffer, target_line, target_col);
+            self.status = String::new();
+            return;
+        }
+        let Some(target_path) = uri_to_path(&hit.uri) else {
+            self.status = format!("Type has unparseable URI {}", hit.uri);
+            return;
+        };
+        if self.buffer.is_dirty() {
+            self.status = "Save first — current buffer has unsaved changes".into();
+            return;
+        }
+        self.push_nav_stack();
+        match self.open_file(&target_path) {
+            Ok(()) => {
+                self.view.goto(&self.buffer, target_line, target_col);
+                self.status = String::new();
+            }
+            Err(e) => {
+                self.nav_stack.pop();
+                self.status = format!("Could not open {}: {e}", target_path.display());
+            }
+        }
     }
 
     /// Open the New-File prompt anchored at the user's current point
@@ -1651,6 +1868,22 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     uri.strip_prefix("file://").map(PathBuf::from)
 }
 
+/// LSP `SymbolKind` values that represent a Rust-style type the user
+/// would expect in a "go to type" dialog: struct, enum, trait,
+/// type-alias, and class-like wrappers other servers use. Source:
+/// LSP spec SymbolKind enum.
+fn is_type_kind(kind: u32) -> bool {
+    matches!(
+        kind,
+        5  // Class
+        | 10 // Enum
+        | 11 // Interface (rust-analyzer maps trait → Interface)
+        | 19 // Object (used for type aliases by some servers)
+        | 23 // Struct
+        | 26 // TypeParameter
+    )
+}
+
 /// Returns `(clients, uri, attempted)`. `attempted` is `true` whenever
 /// the file was in a language we know how to spawn an LSP for, so the
 /// UI can distinguish "spawn failed" (red badge) from "we didn't try"
@@ -1702,6 +1935,7 @@ fn action_intent(action: &Action) -> Option<String> {
         | Action::ToggleHistory
         | Action::ToggleKeysHelp
         | Action::OpenFile
+        | Action::OpenTypeSearch
         | Action::NewFile
         | Action::ToggleAutosave
         | Action::ShowType

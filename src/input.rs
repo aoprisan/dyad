@@ -105,6 +105,10 @@ pub fn map(ev: KeyEvent) -> Option<Action> {
                     // in terminals that do forward modified arrows.
                     'b' => Some(Action::MoveWordLeft),
                     'f' => Some(Action::MoveWordRight),
+                    // Alt-T ("type"): open the workspace type-search
+                    // dialog — fuzzy-match struct/enum/trait names
+                    // across the workspace via LSP `workspace/symbol`.
+                    't' => Some(Action::OpenTypeSearch),
                     _ => None,
                 }
             } else {
@@ -271,6 +275,11 @@ mod tests {
     fn alt_b_f_jump_word() {
         assert!(matches!(map(alt('b')).unwrap(), Action::MoveWordLeft));
         assert!(matches!(map(alt('f')).unwrap(), Action::MoveWordRight));
+    }
+
+    #[test]
+    fn alt_t_opens_type_search() {
+        assert!(matches!(map(alt('t')).unwrap(), Action::OpenTypeSearch));
     }
 
     #[test]
