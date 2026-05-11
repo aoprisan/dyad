@@ -50,6 +50,21 @@ impl Buffer {
         self.touch();
     }
 
+    /// Structural replacement: swap the byte range (typically the byte
+    /// extents of a tree-sitter node returned by `Syntax::ast_query`) for
+    /// `text`. Maps to DESIGN.md §Edits tier-2 `edit.replace_node`; Phase 4
+    /// will expose it over MCP.
+    #[allow(dead_code)] // Phase 4: exposed as `edit.replace_node` over MCP.
+    pub fn replace_node(&mut self, byte_range: Range<usize>, text: &str) {
+        let start = self.rope.byte_to_char(byte_range.start);
+        let end = self.rope.byte_to_char(byte_range.end);
+        if start < end {
+            self.rope.remove(start..end);
+        }
+        self.rope.insert(start, text);
+        self.touch();
+    }
+
     pub fn save(&mut self) -> Result<usize> {
         let path = self
             .path
