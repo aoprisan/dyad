@@ -3,7 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, GitFile, GitGroup, GitView, HistoryView};
+use crate::app::{App, GitFile, GitGroup, GitView, HistoryView, OpenFileView};
 use crate::git::LineStatus;
 use crate::syntax::{self, HighlightSpan};
 use crate::theme;
@@ -46,9 +46,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     // Overlays take over the editor area (gutter + text) when open
     // so the user can scroll long content without fighting the syntax
-    // viewport. Tree sidebar stays visible alongside if open. History
-    // beats diff if somehow both got opened (they shouldn't).
-    if app.history.is_some() {
+    // viewport. Tree sidebar stays visible alongside if open.
+    // Precedence: keys help > open-file > history > diff > normal.
+    if app.keys_help {
+        render_keys_help(frame, editor_area);
+    } else if let Some(view) = app.open_file.as_ref() {
+        render_open_file(frame, editor_area, view);
+    } else if app.history.is_some() {
         render_history(frame, editor_area, app);
     } else if app.diff.is_some() {
         render_diff(frame, editor_area, app);
@@ -57,7 +61,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_text(frame, text_rect, app);
     }
     render_status(frame, status_area, app);
-    if app.diff.is_none() && app.history.is_none() && !app.tree.focused {
+    if !app.keys_help
+        && app.open_file.is_none()
+        && app.diff.is_none()
+        && app.history.is_none()
+        && !app.tree.focused
+    {
         place_cursor(frame, text_rect, app);
     }
 }
@@ -189,6 +198,120 @@ fn render_git_diff(frame: &mut Frame, rect: Rect, view: &GitView) {
     }
     frame.render_widget(Paragraph::new(lines).style(theme::editor()), rect);
 }
+
+fn render_open_file(frame: &mut Frame, rect: Rect, view: &OpenFileView) {
+    let viewport = rect.height as usize;
+    let width = rect.width as usize;
+    let top = scroll_top(view.cursor, viewport, view.matches.len());
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport);
+    if view.matches.is_empty() {
+        let msg = if view.query.is_empty() {
+            "No files".to_string()
+        } else {
+            format!("No matches for \"{}\"", view.query)
+        };
+        lines.push(Line::from(Span::styled(
+            truncate_to(&format!(" {msg}"), width),
+            theme::status_hint(),
+        )));
+    } else {
+        for r in 0..viewport {
+            let row_idx = top + r;
+            let Some(&file_idx) = view.matches.get(row_idx) else {
+                lines.push(Line::raw(""));
+                continue;
+            };
+            let Some(path) = view.files.get(file_idx) else {
+                lines.push(Line::raw(""));
+                continue;
+            };
+            let marker = if row_idx == view.cursor { "▸ " } else { "  " };
+            let text = truncate_to(
+                &format!("{marker}{}", path.display()),
+                width,
+            );
+            let style = if row_idx == view.cursor {
+                theme::tree_selected()
+            } else {
+                theme::editor()
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).style(theme::editor()), rect);
+}
+
+fn render_keys_help(frame: &mut Frame, rect: Rect) {
+    let viewport = rect.height as usize;
+    let width = rect.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport);
+    let section = theme::status_hint();
+    let body = theme::editor();
+    for entry in KEYS_HELP {
+        match *entry {
+            KeyRow::Section(label) => {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled(
+                    truncate_to(&format!(" {label}"), width),
+                    section,
+                )));
+            }
+            KeyRow::Binding(keys, desc) => {
+                let text = truncate_to(&format!("  {keys:<22}  {desc}"), width);
+                lines.push(Line::from(Span::styled(text, body)));
+            }
+        }
+        if lines.len() >= viewport {
+            break;
+        }
+    }
+    while lines.len() < viewport {
+        lines.push(Line::raw(""));
+    }
+    frame.render_widget(Paragraph::new(lines).style(theme::editor()), rect);
+}
+
+enum KeyRow {
+    Section(&'static str),
+    Binding(&'static str, &'static str),
+}
+
+const KEYS_HELP: &[KeyRow] = &[
+    KeyRow::Section("Modals"),
+    KeyRow::Binding("Ctrl-T", "toggle file tree sidebar"),
+    KeyRow::Binding("Ctrl-R", "git status / stage / commit"),
+    KeyRow::Binding("Ctrl-L", "commit history"),
+    KeyRow::Binding("Ctrl-P", "show this keymap"),
+    KeyRow::Binding("Esc", "close modal / clear status"),
+    KeyRow::Section("File"),
+    KeyRow::Binding("Ctrl-S", "save"),
+    KeyRow::Binding("Ctrl-X", "open file (fuzzy)"),
+    KeyRow::Binding("Ctrl-N", "new file (prompt)"),
+    KeyRow::Binding("Ctrl-W", "toggle autosave (~500ms idle)"),
+    KeyRow::Binding("Ctrl-Q", "quit (twice when dirty)"),
+    KeyRow::Section("LSP"),
+    KeyRow::Binding("Ctrl-G", "go to definition"),
+    KeyRow::Binding("Ctrl-O", "back (nav stack)"),
+    KeyRow::Binding("Ctrl-K", "show type at cursor"),
+    KeyRow::Binding("Ctrl-Y", "rename symbol"),
+    KeyRow::Section("Motion"),
+    KeyRow::Binding("Arrows / Alt+hjkl", "move by char / line"),
+    KeyRow::Binding("Ctrl-B / Ctrl-F", "word left / right (Alt+b/f also)"),
+    KeyRow::Binding("Ctrl-A / Ctrl-E", "line start / end"),
+    KeyRow::Binding("Ctrl-U / Ctrl-D", "page up / down"),
+    KeyRow::Binding("Home / End", "line start / end"),
+    KeyRow::Section("Tree (when focused)"),
+    KeyRow::Binding("Up / Down", "move selection"),
+    KeyRow::Binding("Enter", "open file / expand dir / ascend ↰ .."),
+    KeyRow::Section("Git view"),
+    KeyRow::Binding("Up / Down", "move between files (refreshes diff)"),
+    KeyRow::Binding("s / u / c", "stage / unstage / commit"),
+    KeyRow::Binding("Ctrl-U / Ctrl-D", "page the diff"),
+    KeyRow::Section("History view"),
+    KeyRow::Binding("Up / Down", "move between commits"),
+    KeyRow::Binding("Ctrl-U / Ctrl-D", "page the commit show"),
+];
 
 fn render_history(frame: &mut Frame, rect: Rect, app: &App) {
     let Some(view) = app.history.as_ref() else { return };
@@ -432,9 +555,9 @@ fn build_line(chars: &[char], spans: &[HighlightSpan]) -> Line<'static> {
 }
 
 fn render_status(frame: &mut Frame, rect: Rect, app: &App) {
-    // Prompt takes over the entire status bar when active — it's the
-    // user's only interaction surface, so any background text would
-    // just be noise.
+    // Prompt and open-file dialog both take over the status bar —
+    // they're the user's only input surface while active, so any
+    // background text would just be noise.
     if let Some(prompt) = app.prompt.as_ref() {
         let bar = theme::status_bar();
         let text = format!(" {} {}_", prompt.label, prompt.buffer);
@@ -442,6 +565,22 @@ fn render_status(frame: &mut Frame, rect: Rect, app: &App) {
         let pad = total_width.saturating_sub(text.chars().count());
         let mut spans = vec![Span::styled(text, bar)];
         spans.push(Span::styled(" ".repeat(pad), bar));
+        frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+        return;
+    }
+    if let Some(view) = app.open_file.as_ref() {
+        let bar = theme::status_bar();
+        let hint_style = theme::status_hint();
+        let left = format!(" Open file: {}_", view.query);
+        let right = format!(" {} match(es) ", view.matches.len());
+        let total_width = rect.width as usize;
+        let pad = total_width
+            .saturating_sub(left.chars().count() + right.chars().count());
+        let spans = vec![
+            Span::styled(left, bar),
+            Span::styled(" ".repeat(pad), bar),
+            Span::styled(right, hint_style),
+        ];
         frame.render_widget(Paragraph::new(Line::from(spans)), rect);
         return;
     }
@@ -464,6 +603,8 @@ fn render_status(frame: &mut Frame, rect: Rect, app: &App) {
     } else if let Some((label, severity)) = current_line_diagnostic(app) {
         let style = theme::status_bar().fg(theme::diagnostic(severity));
         (label, style)
+    } else if app.keys_help {
+        (KEYS_HINT_TEXT.to_string(), hint)
     } else if app.history.is_some() {
         (HISTORY_HINT_TEXT.to_string(), hint)
     } else if app.diff.is_some() {
@@ -527,7 +668,9 @@ fn lsp_badge_span(app: &App) -> Option<Span<'static>> {
 }
 
 const HINT_TEXT: &str =
-    " Ctrl-T tree · Ctrl-K type · Ctrl-Y rename · Ctrl-R git · Ctrl-S save · Ctrl-Q quit ";
+    " Ctrl-P keys · Ctrl-X open · Ctrl-T tree · Ctrl-K type · Ctrl-R git · Ctrl-S save ";
+
+const KEYS_HINT_TEXT: &str = " Esc close · Ctrl-P toggle ";
 
 const TREE_HINT_TEXT: &str =
     " ↑/↓ move · Enter open · Esc close · Ctrl-T toggle ";

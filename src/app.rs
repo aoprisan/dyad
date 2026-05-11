@@ -65,6 +65,13 @@ pub struct App {
     /// Commit-history overlay (Ctrl-L). Independent from `diff`;
     /// has its own routing in `apply`.
     pub history: Option<HistoryView>,
+    /// Ctrl-P keybinding-reference overlay. Simple visibility flag —
+    /// the view's content is fully static so no other state needed.
+    pub keys_help: bool,
+    /// Ctrl-X fuzzy file-open dialog. `Some` while the dialog is
+    /// visible; holds the (full) candidate list, the user's query,
+    /// and the filtered match indices that drive rendering.
+    pub open_file: Option<OpenFileView>,
     /// Git overlay (Ctrl-R). `Some` while the overlay is visible.
     /// Holds the change-list, the diff for the currently-selected
     /// file, and the repo root we resolved when the overlay opened
@@ -90,6 +97,25 @@ pub enum PromptKind {
     /// to the symbol the user actually wanted to rename, even if they
     /// move the cursor while typing into the prompt.
     RenameSymbol { line: u32, character: u32 },
+}
+
+pub struct OpenFileView {
+    /// Root the dialog was opened against. New buffers resolve names
+    /// relative to this so we can show short relative paths.
+    pub root: PathBuf,
+    /// All non-hidden, non-junk files under `root`, sorted. Captured
+    /// once at open time — refresh = close + reopen.
+    pub files: Vec<PathBuf>,
+    /// What the user has typed so far. Replaces the buffer cursor
+    /// while the dialog is open; routing in `apply` funnels keys
+    /// straight in.
+    pub query: String,
+    /// Indices into `files` matching the current query, score-sorted
+    /// (prefix matches before mid-string matches).
+    pub matches: Vec<usize>,
+    /// Position within `matches`; Up/Down moves this.
+    pub cursor: usize,
+    pub top: usize,
 }
 
 pub struct HistoryView {
@@ -182,6 +208,8 @@ impl App {
             tree: FileTree::new(tree_root),
             diff: None,
             history: None,
+            keys_help: false,
+            open_file: None,
             prompt: None,
             autosave: false,
             last_edit: None,
@@ -210,6 +238,8 @@ impl App {
             tree,
             diff: None,
             history: None,
+            keys_help: false,
+            open_file: None,
             prompt: None,
             autosave: false,
             last_edit: None,
@@ -286,6 +316,15 @@ impl App {
         match action {
             Action::ToggleTree => {
                 self.tree.focused = !self.tree.focused;
+                // On open: expand the tree down to the file the user
+                // is currently editing and select it. Skipped for
+                // scratch buffers (no path) and when the buffer's
+                // file lives outside the tree root.
+                if self.tree.focused
+                    && let Some(path) = self.buffer.path()
+                {
+                    self.tree.reveal(path);
+                }
                 return Ok(());
             }
             Action::ToggleGitDiff => {
@@ -294,6 +333,14 @@ impl App {
             }
             Action::ToggleHistory => {
                 self.toggle_history();
+                return Ok(());
+            }
+            Action::ToggleKeysHelp => {
+                self.keys_help = !self.keys_help;
+                return Ok(());
+            }
+            Action::OpenFile => {
+                self.start_open_file_dialog();
                 return Ok(());
             }
             Action::NewFile => {
@@ -310,16 +357,34 @@ impl App {
                 return Ok(());
             }
             Action::Escape => {
-                if self.history.is_some() {
+                if self.keys_help {
+                    self.keys_help = false;
+                } else if self.open_file.is_some() {
+                    self.open_file = None;
+                } else if self.history.is_some() {
                     self.history = None;
                 } else if self.diff.is_some() {
                     self.diff = None;
                 } else if self.tree.focused {
                     self.tree.focused = false;
+                } else {
+                    // Nothing modal to close — fall through to clear
+                    // any transient status (Ctrl-K type hint, save
+                    // confirmation, error message) so the status bar
+                    // returns to its default keymap hint.
+                    self.status.clear();
+                    self.quit_pending = false;
                 }
                 return Ok(());
             }
             Action::Save | Action::Quit => {}
+            // Help overlay swallows everything else — nothing should
+            // mutate state while the user is reading the keymap.
+            _ if self.keys_help => return Ok(()),
+            _ if self.open_file.is_some() => {
+                self.drive_open_file(action)?;
+                return Ok(());
+            }
             _ if self.history.is_some() => {
                 self.drive_history(action);
                 return Ok(());
@@ -422,6 +487,8 @@ impl App {
             Action::ToggleTree
             | Action::ToggleGitDiff
             | Action::ToggleHistory
+            | Action::ToggleKeysHelp
+            | Action::OpenFile
             | Action::NewFile
             | Action::ToggleAutosave
             | Action::Escape => {}
@@ -548,6 +615,104 @@ impl App {
                 col: self.view.cursor_col(),
             });
         }
+    }
+
+    /// Ctrl-X — pop up the fuzzy file-open dialog rooted at the
+    /// project root (tree.root). Files are gathered on open (one
+    /// walk, then filter-in-memory on each keystroke) so the dialog
+    /// stays responsive without any background indexing.
+    fn start_open_file_dialog(&mut self) {
+        if self.open_file.is_some() {
+            return;
+        }
+        let root = self.tree.root.clone();
+        let files = walk_files(&root);
+        if files.is_empty() {
+            self.status = "No files under project root".into();
+            return;
+        }
+        let matches: Vec<usize> = (0..files.len()).collect();
+        self.open_file = Some(OpenFileView {
+            root,
+            files,
+            query: String::new(),
+            matches,
+            cursor: 0,
+            top: 0,
+        });
+    }
+
+    /// Route a key into the open-file dialog. Letters/Backspace edit
+    /// the query (which re-filters), arrows navigate matches, Enter
+    /// opens the selected entry, Esc cancels.
+    fn drive_open_file(&mut self, action: Action) -> Result<()> {
+        let Some(view) = self.open_file.as_mut() else {
+            return Ok(());
+        };
+        let mut refilter = false;
+        match action {
+            Action::Insert('\n') => {
+                let selection = view
+                    .matches
+                    .get(view.cursor)
+                    .and_then(|&i| view.files.get(i))
+                    .cloned();
+                let root = view.root.clone();
+                self.open_file = None;
+                if let Some(rel) = selection {
+                    let full = root.join(rel);
+                    if self.buffer.is_dirty() {
+                        self.status =
+                            "Save first — current buffer has unsaved changes".into();
+                        return Ok(());
+                    }
+                    self.push_nav_stack();
+                    match self.open_file(&full) {
+                        Ok(()) => self.status = String::new(),
+                        Err(e) => {
+                            self.nav_stack.pop();
+                            self.status =
+                                format!("Could not open {}: {e}", full.display());
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            Action::Insert(c) if !c.is_control() => {
+                view.query.push(c);
+                refilter = true;
+            }
+            Action::DeletePrev => {
+                if view.query.pop().is_some() {
+                    refilter = true;
+                }
+            }
+            Action::MoveUp => {
+                if view.cursor > 0 {
+                    view.cursor -= 1;
+                }
+            }
+            Action::MoveDown => {
+                if view.cursor + 1 < view.matches.len() {
+                    view.cursor += 1;
+                }
+            }
+            Action::MoveHome => view.cursor = 0,
+            Action::MoveEnd => {
+                if !view.matches.is_empty() {
+                    view.cursor = view.matches.len() - 1;
+                }
+            }
+            // Other input (arrows in-line, etc.) is swallowed — the
+            // dialog is its own little world.
+            _ => {}
+        }
+        if refilter {
+            view.matches = filter_files(&view.files, &view.query);
+            view.cursor = 0;
+            view.top = 0;
+        }
+        Ok(())
     }
 
     /// Open the New-File prompt anchored at the user's current point
@@ -1224,6 +1389,13 @@ impl App {
         self.lsp_uri = new_uri;
         self.lsp_version = 0;
         self.view = View::new();
+        // Keep the tree's cursor in sync with whatever file is now
+        // loaded so a subsequent Ctrl-T lands on it without a second
+        // navigation step. No-op when the file is outside the tree
+        // root or hidden by the dot-prefix filter.
+        if let Some(p) = self.buffer.path() {
+            self.tree.reveal(p);
+        }
         Ok(())
     }
 }
@@ -1278,6 +1450,64 @@ fn word_at_cursor(buffer: &Buffer, view: &View) -> String {
 
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// Walk `root` recursively and collect non-hidden source files,
+/// skipping common build / vendor directories. Returns paths relative
+/// to `root`, sorted, and capped at 20k entries so a monorepo scan
+/// can't blow up memory.
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if out.len() >= 20_000 {
+            break;
+        }
+        let Ok(reader) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for ent in reader.filter_map(|r| r.ok()) {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            if matches!(
+                name.as_str(),
+                "target" | "node_modules" | "dist" | "build" | "vendor" | "venv" | "__pycache__"
+            ) {
+                continue;
+            }
+            let p = ent.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(rel) = p.strip_prefix(root) {
+                out.push(rel.to_path_buf());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Substring match (case-insensitive) against the full relative
+/// path. Score = position of the first match (earlier = better);
+/// stable-sort by score, so an empty query keeps the source order
+/// from `walk_files`.
+fn filter_files(files: &[PathBuf], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..files.len()).collect();
+    }
+    let q = query.to_lowercase();
+    let mut scored: Vec<(usize, usize)> = files
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let s = p.to_string_lossy().to_lowercase();
+            s.find(&q).map(|pos| (i, pos))
+        })
+        .collect();
+    scored.sort_by_key(|&(_, pos)| pos);
+    scored.into_iter().map(|(i, _)| i).collect()
 }
 
 /// True when `s` looks like a bare `crate::module::Item` path — used
@@ -1450,6 +1680,8 @@ fn action_intent(action: &Action) -> Option<String> {
         | Action::ToggleTree
         | Action::ToggleGitDiff
         | Action::ToggleHistory
+        | Action::ToggleKeysHelp
+        | Action::OpenFile
         | Action::NewFile
         | Action::ToggleAutosave
         | Action::ShowType

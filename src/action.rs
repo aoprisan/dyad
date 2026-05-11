@@ -22,6 +22,8 @@ pub enum Action {
     ToggleTree,
     ToggleGitDiff,
     ToggleHistory,
+    ToggleKeysHelp,
+    OpenFile,
     NewFile,
     ToggleAutosave,
     Escape,

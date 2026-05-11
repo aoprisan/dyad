@@ -97,6 +97,48 @@ impl FileTree {
         Activation::None
     }
 
+    /// Expand directories down to `target` and place the cursor on
+    /// the corresponding entry. Returns `true` when the file was
+    /// found; `false` when it's outside the tree root, hidden by the
+    /// `.`-filter, or otherwise not listed. Canonicalizes `target`
+    /// first so callers can pass either absolute or relative paths.
+    pub fn reveal(&mut self, target: &Path) -> bool {
+        let abs = target
+            .canonicalize()
+            .unwrap_or_else(|_| target.to_path_buf());
+        let Ok(rel) = abs.strip_prefix(&self.root) else {
+            return false;
+        };
+        let mut walking = self.root.clone();
+        let mut components: Vec<_> = rel.components().collect();
+        let Some(last) = components.pop() else {
+            return false;
+        };
+        for comp in components {
+            walking.push(comp);
+            let Some(idx) = self
+                .entries
+                .iter()
+                .position(|e| !e.is_parent_link && e.is_dir && e.path == walking)
+            else {
+                return false;
+            };
+            if !self.entries[idx].expanded {
+                self.expand_at(idx);
+            }
+        }
+        walking.push(last);
+        if let Some(idx) = self
+            .entries
+            .iter()
+            .position(|e| !e.is_parent_link && e.path == walking)
+        {
+            self.cursor = idx;
+            return true;
+        }
+        false
+    }
+
     /// Move the tree root one level up. Existing expansion state is
     /// discarded — the new root re-lists from disk with everything
     /// collapsed, which is the least-surprising default for "go up".

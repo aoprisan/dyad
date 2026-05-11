@@ -81,6 +81,14 @@ pub fn map(ev: KeyEvent) -> Option<Action> {
                     // buffer (cross-file edits are skipped with a
                     // count in the status bar).
                     'y' => Some(Action::Rename),
+                    // Ctrl-P ("palette"): show every keybinding in
+                    // an overlay. Esc or Ctrl-P again closes it.
+                    'p' => Some(Action::ToggleKeysHelp),
+                    // Ctrl-X ("eXamine files"): fuzzy-open dialog
+                    // rooted at the project root. Substring match
+                    // against every non-hidden file under the root;
+                    // Up/Down picks, Enter opens, Esc cancels.
+                    'x' => Some(Action::OpenFile),
                     _ => None,
                 }
             } else if alt {
