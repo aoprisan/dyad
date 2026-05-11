@@ -10,6 +10,7 @@ mod git;
 mod input;
 mod lsp;
 mod mcp;
+mod proposals;
 mod protocol;
 mod syntax;
 mod terminal;

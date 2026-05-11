@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::buffer::Buffer;
 use crate::git;
 use crate::lsp::{self, Diagnostic, Location, LspClient, TextEdit};
+use crate::proposals::{PendingProposal, Proposal, ProposalId, ProposalKind, ProposalQueue};
 use crate::syntax::{AstMatch, Syntax};
 use crate::tx::{Change, ChangeId, TxId, TxManager};
 
@@ -48,6 +49,8 @@ pub struct ProtocolState {
     /// Stable identifier for this client (the current MCP session).
     /// Surfaced via `clients.list`.
     client_id: String,
+    /// Phase 10 — agent-submitted edits awaiting accept/reject.
+    proposals: ProposalQueue,
 }
 
 struct BufferEntry {
@@ -125,6 +128,7 @@ impl ProtocolState {
             lsp: None,
             workspace_root: None,
             client_id: format!("mcp-{}", std::process::id()),
+            proposals: ProposalQueue::new(),
         };
         state.buffer_open(path)?;
         Ok(state)
@@ -502,6 +506,100 @@ impl ProtocolState {
             applied,
             skipped_files,
         })
+    }
+
+    // ---------- Proposals (Phase 10) ----------
+
+    /// Queue a deferred `edit.replace_range` against `buffer_id`. The
+    /// version is *recorded*, not checked here — staleness is detected
+    /// at `proposal_accept` time so the agent can author proposals
+    /// against a snapshot the buffer may have moved past.
+    pub fn propose_replace_range(
+        &mut self,
+        buffer_id: u64,
+        version: u64,
+        range: CharRange,
+        text: String,
+        intent: String,
+    ) -> Result<ProposalId> {
+        if !self.buffers.contains_key(&buffer_id) {
+            return Err(anyhow!("unknown buffer_id {}", buffer_id));
+        }
+        Ok(self.proposals.enqueue(PendingProposal {
+            buffer_id,
+            intent,
+            kind: ProposalKind::ReplaceRange {
+                version,
+                start: range.start,
+                end: range.end,
+                text,
+            },
+        }))
+    }
+
+    pub fn proposals_list(&self) -> Vec<Proposal> {
+        self.proposals.list()
+    }
+
+    /// Pull the proposal out of the queue and run it through the same
+    /// tx machinery a direct edit would use — the proposal's intent is
+    /// the tx intent, so it lands in flat history with that string.
+    /// Errors with the proposal *put back* if the buffer version moved.
+    pub fn proposal_accept(&mut self, id: ProposalId) -> Result<u64> {
+        let proposal = self
+            .proposals
+            .take(id)
+            .ok_or_else(|| anyhow!("unknown proposal_id {:?}", id))?;
+        match proposal.kind.clone() {
+            ProposalKind::ReplaceRange {
+                version,
+                start,
+                end,
+                text,
+            } => {
+                // Open an explicit tx with the proposal's intent so the
+                // history entry shows what the agent said, not the
+                // synthetic auto-tx string.
+                let tx_id = self
+                    .tx_begin(proposal.buffer_id, proposal.intent.clone(), None)
+                    .inspect_err(|_| {
+                        // Re-queue so the caller can retry / reject.
+                        self.proposals.enqueue(PendingProposal {
+                            buffer_id: proposal.buffer_id,
+                            intent: proposal.intent.clone(),
+                            kind: proposal.kind.clone(),
+                        });
+                    })?;
+                match self.edit_replace_range(
+                    proposal.buffer_id,
+                    version,
+                    CharRange { start, end },
+                    &text,
+                ) {
+                    Ok(new_version) => {
+                        self.tx_commit(tx_id)?;
+                        Ok(new_version)
+                    }
+                    Err(e) => {
+                        let _ = self.tx_rollback(tx_id);
+                        // Put the proposal back so a future retry sees it.
+                        self.proposals.enqueue(PendingProposal {
+                            buffer_id: proposal.buffer_id,
+                            intent: proposal.intent.clone(),
+                            kind: proposal.kind.clone(),
+                        });
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn proposal_reject(&mut self, id: ProposalId) -> Result<()> {
+        self.proposals
+            .take(id)
+            .ok_or_else(|| anyhow!("unknown proposal_id {:?}", id))?;
+        Ok(())
     }
 
     // ---------- Git (Phase 9) ----------
@@ -952,6 +1050,81 @@ mod tests {
         assert_eq!(clients.len(), 1);
         assert_eq!(clients[0].kind, "agent");
         assert_eq!(clients[0].focus, Some(SOLE_BUFFER_ID));
+    }
+
+    // ---------- Phase 10 proposals ----------
+
+    #[test]
+    fn proposal_accept_applies_the_edit_and_carries_intent_into_history() {
+        let mut state = scratch_state("propose_accept");
+        let v = state.buffer_version(SOLE_BUFFER_ID).unwrap();
+        let id = state
+            .propose_replace_range(
+                SOLE_BUFFER_ID,
+                v,
+                CharRange { start: 3, end: 8 },
+                "farewell".into(),
+                "rename hello -> farewell".into(),
+            )
+            .unwrap();
+        // Queue has one entry.
+        assert_eq!(state.proposals_list().len(), 1);
+
+        state.proposal_accept(id).unwrap();
+        assert_eq!(text_of(&state, SOLE_BUFFER_ID), "fn farewell() {}\n");
+        // Queue drains after accept.
+        assert!(state.proposals_list().is_empty());
+
+        let history = state.history_recent(10);
+        let last = history.last().unwrap();
+        assert_eq!(last.intent, "rename hello -> farewell");
+    }
+
+    #[test]
+    fn proposal_reject_discards_without_applying() {
+        let mut state = scratch_state("propose_reject");
+        let pre = text_of(&state, SOLE_BUFFER_ID);
+        let v = state.buffer_version(SOLE_BUFFER_ID).unwrap();
+        let id = state
+            .propose_replace_range(
+                SOLE_BUFFER_ID,
+                v,
+                CharRange { start: 0, end: 0 },
+                "// proposed\n".into(),
+                "add a doc comment".into(),
+            )
+            .unwrap();
+        state.proposal_reject(id).unwrap();
+        assert_eq!(text_of(&state, SOLE_BUFFER_ID), pre);
+        assert!(state.proposals_list().is_empty());
+    }
+
+    #[test]
+    fn proposal_accept_on_stale_version_errors_and_requeues() {
+        let mut state = scratch_state("propose_stale");
+        let stale = state.buffer_version(SOLE_BUFFER_ID).unwrap();
+        let id = state
+            .propose_replace_range(
+                SOLE_BUFFER_ID,
+                stale,
+                CharRange { start: 0, end: 0 },
+                "x".into(),
+                "stale insert".into(),
+            )
+            .unwrap();
+        // Move the buffer forward, invalidating the proposal's version.
+        let v_now = state.buffer_version(SOLE_BUFFER_ID).unwrap();
+        state
+            .edit_replace_range(SOLE_BUFFER_ID, v_now, CharRange { start: 0, end: 0 }, "y")
+            .unwrap();
+
+        let err = state.proposal_accept(id).unwrap_err();
+        assert!(err.to_string().contains("version mismatch"));
+        // The proposal stays in the queue under a NEW id so the agent
+        // can `proposals.list` and decide what to do.
+        let still_queued = state.proposals_list();
+        assert_eq!(still_queued.len(), 1);
+        assert_ne!(still_queued[0].id, id);
     }
 
     #[test]

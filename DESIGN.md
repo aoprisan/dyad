@@ -218,6 +218,14 @@ Known scope limits in this iteration:
   patch. Both shell out to `git`; agents and humans see whatever the
   on-disk file says — unsaved buffer changes don't yet feed into the
   diff (would need a temp-file or in-process diff algorithm).
+- Phase 10 ships the protocol surface for proposals
+  (`edit.propose_range`, `proposals.list`, `proposals.accept`,
+  `proposals.reject`). Accept runs the deferred edit through the same
+  tx machinery as a direct edit, with the proposal's intent string as
+  the tx intent (so flat history shows the agent's words). Stale-
+  version accept errors and re-queues the proposal under a new id.
+  The TUI hunk panel + accept/reject keybindings need the TUI+MCP
+  coexistence work that's deferred from Phase 8.
 - No `view.*`, `symbol.references`, `symbol.signature`,
   `edit.extract_function`, `edit.add_import`, `edit.inline`, or
   `note.pin` yet.

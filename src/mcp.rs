@@ -124,6 +124,42 @@ fn tools_list_result() -> Value {
                     "buffer_id": {"type": "integer"},
                 },
             })),
+            tool_def("edit.propose_range", "Queue an `edit.replace_range` for review instead of applying it. Returns a proposal_id. The reviewer (eventually a human at the TUI) accepts or rejects via the `proposals.*` tools.", json!({
+                "type": "object",
+                "required": ["buffer_id", "version", "range", "text", "intent"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                    "version":   {"type": "integer"},
+                    "range": {
+                        "type": "object",
+                        "required": ["start", "end"],
+                        "properties": {
+                            "start": {"type": "integer", "minimum": 0},
+                            "end":   {"type": "integer", "minimum": 0},
+                        },
+                    },
+                    "text":   {"type": "string"},
+                    "intent": {"type": "string"},
+                },
+            })),
+            tool_def("proposals.list", "List queued proposals: [{id, buffer_id, intent, kind: {kind, ...}}].", json!({
+                "type": "object",
+                "properties": {},
+            })),
+            tool_def("proposals.accept", "Apply a queued proposal through the tx machinery (using the proposal's intent). Errors if the buffer version moved; the proposal is re-queued so the agent can retry.", json!({
+                "type": "object",
+                "required": ["proposal_id"],
+                "properties": {
+                    "proposal_id": {"type": "integer"},
+                },
+            })),
+            tool_def("proposals.reject", "Discard a queued proposal without applying.", json!({
+                "type": "object",
+                "required": ["proposal_id"],
+                "properties": {
+                    "proposal_id": {"type": "integer"},
+                },
+            })),
             tool_def("buffer.read", "Read all or part of a buffer's text. Returns {text, version}.", json!({
                 "type": "object",
                 "required": ["buffer_id"],
@@ -306,6 +342,44 @@ fn dispatch_tool(
             let a: Args = serde_json::from_value(args)?;
             let diff = state.git_diff(a.buffer_id)?;
             Ok(json!({ "diff": diff }))
+        }
+        "edit.propose_range" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+                version: u64,
+                range: CharRange,
+                text: String,
+                intent: String,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            let id = state.propose_replace_range(
+                a.buffer_id,
+                a.version,
+                a.range,
+                a.text,
+                a.intent,
+            )?;
+            Ok(json!({ "proposal_id": id }))
+        }
+        "proposals.list" => Ok(json!(state.proposals_list())),
+        "proposals.accept" => {
+            #[derive(Deserialize)]
+            struct Args {
+                proposal_id: crate::proposals::ProposalId,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            let new_version = state.proposal_accept(a.proposal_id)?;
+            Ok(json!({ "version": new_version }))
+        }
+        "proposals.reject" => {
+            #[derive(Deserialize)]
+            struct Args {
+                proposal_id: crate::proposals::ProposalId,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            state.proposal_reject(a.proposal_id)?;
+            Ok(json!({}))
         }
         "buffer.read" => {
             #[derive(Deserialize)]
@@ -549,6 +623,10 @@ mod tests {
             "buffer.close",
             "clients.list",
             "git.diff",
+            "edit.propose_range",
+            "proposals.list",
+            "proposals.accept",
+            "proposals.reject",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
