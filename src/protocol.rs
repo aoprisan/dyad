@@ -18,6 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::buffer::Buffer;
+use crate::lsp::{self, Diagnostic, Location, LspClient};
 use crate::syntax::{AstMatch, Syntax};
 use crate::tx::{Change, ChangeId, TxId, TxManager};
 
@@ -28,6 +29,17 @@ pub struct ProtocolState {
     /// Currently open explicit transaction, if any. Edits join this tx
     /// rather than auto-wrapping themselves.
     explicit_tx: Option<TxId>,
+    /// Optional rust-analyzer connection. `None` when the file isn't
+    /// Rust, doesn't live in a Cargo workspace, or rust-analyzer
+    /// couldn't be spawned — the protocol still works, just without
+    /// semantic tools.
+    lsp: Option<LspClient>,
+    /// `file://...` URI for the buffer. Set whenever the buffer has a
+    /// path; LSP tools require this to be `Some`.
+    buffer_uri: Option<String>,
+    /// Monotonic LSP document version (separate from `Buffer::version`
+    /// because LSP needs an i32 starting at 0).
+    lsp_version: i32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -68,11 +80,15 @@ impl ProtocolState {
         if let Some(syn) = syntax.as_mut() {
             syn.refresh(&mut buffer);
         }
+        let (lsp, buffer_uri) = try_spawn_lsp(&buffer);
         Ok(Self {
             buffer,
             syntax,
             tx_manager: TxManager::new(),
             explicit_tx: None,
+            lsp,
+            buffer_uri,
+            lsp_version: 0,
         })
     }
 
@@ -160,6 +176,7 @@ impl ProtocolState {
             },
         )?;
         self.refresh_syntax();
+        self.notify_lsp_changed();
         Ok(self.buffer.version())
     }
 
@@ -192,6 +209,7 @@ impl ProtocolState {
             },
         )?;
         self.refresh_syntax();
+        self.notify_lsp_changed();
         Ok(self.buffer.version())
     }
 
@@ -239,6 +257,7 @@ impl ProtocolState {
             syn.invalidate();
         }
         self.refresh_syntax();
+        self.notify_lsp_changed();
         Ok(())
     }
 
@@ -246,6 +265,39 @@ impl ProtocolState {
 
     pub fn history_recent(&self, limit: usize) -> Vec<Change> {
         self.tx_manager.recent(limit).to_vec()
+    }
+
+    // ---------- Semantic (LSP) ----------
+
+    pub fn symbol_definition(
+        &self,
+        buffer_id: u64,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<Location>> {
+        self.check_buffer(buffer_id)?;
+        let lsp = self
+            .lsp
+            .as_ref()
+            .context("rust-analyzer not running (see `rustup component add rust-analyzer`)")?;
+        let uri = self
+            .buffer_uri
+            .as_ref()
+            .context("buffer has no file URI; cannot query LSP")?;
+        lsp.definition(uri, line, character)
+    }
+
+    pub fn diag_current(&self, buffer_id: u64) -> Result<Vec<Diagnostic>> {
+        self.check_buffer(buffer_id)?;
+        let lsp = self
+            .lsp
+            .as_ref()
+            .context("rust-analyzer not running (see `rustup component add rust-analyzer`)")?;
+        let uri = self
+            .buffer_uri
+            .as_ref()
+            .context("buffer has no file URI; cannot query LSP")?;
+        Ok(lsp.diagnostics(uri))
     }
 
     // ---------- Read-only accessors (for tests + transport) ----------
@@ -311,7 +363,41 @@ impl ProtocolState {
             syn.refresh(&mut self.buffer);
         }
     }
+
+    fn notify_lsp_changed(&mut self) {
+        if let (Some(lsp), Some(uri)) = (self.lsp.as_ref(), self.buffer_uri.as_ref()) {
+            self.lsp_version += 1;
+            let text = self.buffer.rope().to_string();
+            // Best-effort: an LSP I/O error doesn't fail the edit.
+            let _ = lsp.did_change(uri, self.lsp_version, &text);
+        }
+    }
 }
+
+/// Try to spawn rust-analyzer for the buffer's file. Returns
+/// `(Some(client), Some(uri))` on success, `(None, Some(uri))` if the
+/// file exists but rust-analyzer couldn't start, and `(None, None)`
+/// when the buffer is unsaved / pathless. Failures log to stderr and
+/// degrade gracefully — the protocol still serves non-LSP tools.
+fn try_spawn_lsp(buffer: &Buffer) -> (Option<LspClient>, Option<String>) {
+    let Some(path) = buffer.path() else {
+        return (None, None);
+    };
+    let uri = lsp::path_to_uri(path);
+    if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+        return (None, Some(uri));
+    }
+    let workspace = lsp::workspace_root_for(path);
+    let text = buffer.rope().to_string();
+    match LspClient::spawn_rust(&workspace, &uri, &text) {
+        Ok(client) => (Some(client), Some(uri)),
+        Err(e) => {
+            eprintln!("dyad: LSP disabled ({e})");
+            (None, Some(uri))
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

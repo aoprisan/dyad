@@ -195,8 +195,13 @@ cargo build --release && scripts/mcp-smoke.sh
 Known scope limits in this iteration:
 - One buffer per `--mcp` invocation; `buffer.open` is implicit from the
   CLI path.
-- No `view.*`, `symbol.*`, `diag.*`, or `note.pin` yet (those depend on
-  LSP and multi-client awareness, Phases 6 / 8).
+- `symbol.definition` and `diag.current` require `rust-analyzer` on
+  `PATH`. Install with `rustup component add rust-analyzer` (or `brew
+  install rust-analyzer`). Without it the LSP tools return an error
+  but every other tool still works.
+- No `view.*`, `symbol.references`, `symbol.signature`, or `note.pin`
+  yet — Phase 6 only ships the minimum LSP surface (definition +
+  diagnostics); the rest comes later in Phase 6/7.
 - Edits without an explicit `tx.begin` auto-open + auto-commit a
   one-shot transaction with a synthetic intent string. Multi-step
   refactors should call `tx.begin("rename X for clarity")` first.

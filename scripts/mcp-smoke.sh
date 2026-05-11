@@ -67,6 +67,8 @@ assert_contains 1 '"serverInfo"'
 assert_contains 1 '"name":"dyad"'
 assert_contains 2 '"name":"buffer.list"'
 assert_contains 2 '"name":"edit.replace_range"'
+assert_contains 2 '"name":"symbol.definition"'
+assert_contains 2 '"name":"diag.current"'
 assert_contains 3 'fn hello() {}'
 # id=4's payload is a JSON-stringified array inside an MCP text content
 # item, so quotes are backslash-escaped on the wire — match that form.

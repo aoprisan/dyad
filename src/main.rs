@@ -7,6 +7,7 @@ mod action;
 mod app;
 mod buffer;
 mod input;
+mod lsp;
 mod mcp;
 mod protocol;
 mod syntax;

@@ -185,6 +185,22 @@ fn tools_list_result() -> Value {
                     "limit": {"type": "integer", "minimum": 0},
                 },
             })),
+            tool_def("symbol.definition", "Find the LSP definition location for a symbol at the given zero-based line/character. Requires rust-analyzer.", json!({
+                "type": "object",
+                "required": ["buffer_id", "line", "character"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                    "line":      {"type": "integer", "minimum": 0},
+                    "character": {"type": "integer", "minimum": 0},
+                },
+            })),
+            tool_def("diag.current", "Return cached LSP diagnostics for a buffer (severity 1=error..4=hint). Requires rust-analyzer.", json!({
+                "type": "object",
+                "required": ["buffer_id"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                },
+            })),
         ]
     })
 }
@@ -303,6 +319,24 @@ fn dispatch_tool(
             }
             let a: Args = serde_json::from_value(args)?;
             Ok(json!(state.history_recent(a.limit)))
+        }
+        "symbol.definition" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+                line: u32,
+                character: u32,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            Ok(json!(state.symbol_definition(a.buffer_id, a.line, a.character)?))
+        }
+        "diag.current" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            Ok(json!(state.diag_current(a.buffer_id)?))
         }
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
     }
@@ -424,6 +458,8 @@ mod tests {
             "tx.commit",
             "tx.rollback",
             "history.recent",
+            "symbol.definition",
+            "diag.current",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
