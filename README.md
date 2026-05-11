@@ -44,6 +44,7 @@ Non-modal — letter keys always insert.
 | Arrows / Alt+h,j,k,l | Move cursor                         |
 | Ctrl-S               | Save                                |
 | Ctrl-G (or F12, Ctrl-]) | Go to definition (LSP, Rust files) |
+| Alt-T                | Find type (workspace symbol search) |
 | Ctrl-O               | Jump back (navigation stack)        |
 | Ctrl-Q               | Quit                                |
 

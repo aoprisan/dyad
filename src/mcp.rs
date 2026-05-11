@@ -256,6 +256,14 @@ fn tools_list_result() -> Value {
                     "character": {"type": "integer", "minimum": 0},
                 },
             })),
+            tool_def("symbol.workspace_search", "Fuzzy-search workspace symbols (types, functions, etc) via LSP `workspace/symbol`. `buffer_id` picks the language server to query; the search itself is workspace-wide. Requires a running language server (rust-analyzer for .rs, metals for .scala/.sc/.sbt).", json!({
+                "type": "object",
+                "required": ["buffer_id", "query"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                    "query":     {"type": "string"},
+                },
+            })),
             tool_def("diag.current", "Return cached LSP diagnostics for a buffer (severity 1=error..4=hint). Requires a running language server (rust-analyzer for .rs, metals for .scala/.sc/.sbt).", json!({
                 "type": "object",
                 "required": ["buffer_id"],
@@ -470,6 +478,15 @@ fn dispatch_tool(
             let a: Args = serde_json::from_value(args)?;
             Ok(json!(state.symbol_definition(a.buffer_id, a.line, a.character)?))
         }
+        "symbol.workspace_search" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+                query: String,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            Ok(json!(state.symbol_workspace_search(a.buffer_id, &a.query)?))
+        }
         "diag.current" => {
             #[derive(Deserialize)]
             struct Args {
@@ -617,6 +634,7 @@ mod tests {
             "tx.rollback",
             "history.recent",
             "symbol.definition",
+            "symbol.workspace_search",
             "diag.current",
             "edit.rename_symbol",
             "buffer.open",

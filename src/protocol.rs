@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::buffer::Buffer;
 use crate::git;
 use crate::language::Language;
-use crate::lsp::{self, Diagnostic, Location, LspClient, TextEdit};
+use crate::lsp::{self, Diagnostic, Location, LspClient, SymbolInformation, TextEdit};
 use crate::proposals::{PendingProposal, Proposal, ProposalId, ProposalKind, ProposalQueue};
 use crate::syntax::{AstMatch, Syntax};
 use crate::tx::{Change, ChangeId, TxId, TxManager};
@@ -406,6 +406,19 @@ impl ProtocolState {
     ) -> Result<Vec<Location>> {
         let (lsp, uri) = self.lsp_for_buffer(buffer_id)?;
         lsp.definition(uri, line, character)
+    }
+
+    /// Run `workspace/symbol` against the LSP client serving
+    /// `buffer_id`. `buffer_id` only picks the language server (the
+    /// query itself is workspace-wide), so any buffer in a supported
+    /// language works.
+    pub fn symbol_workspace_search(
+        &self,
+        buffer_id: u64,
+        query: &str,
+    ) -> Result<Vec<SymbolInformation>> {
+        let (lsp, _uri) = self.lsp_for_buffer(buffer_id)?;
+        lsp.workspace_symbol(query)
     }
 
     pub fn diag_current(&self, buffer_id: u64) -> Result<Vec<Diagnostic>> {

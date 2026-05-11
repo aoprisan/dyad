@@ -82,6 +82,19 @@ pub struct WorkspaceEdit {
     pub changes: std::collections::HashMap<String, Vec<TextEdit>>,
 }
 
+/// Subset of LSP `SymbolInformation` / `WorkspaceSymbol` used by
+/// `workspace/symbol`. Both spec variants share `name`, `kind`, and a
+/// `location` whose `uri`+`range` we can navigate to; that's the only
+/// payload the type-search dialog needs.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SymbolInformation {
+    pub name: String,
+    pub kind: u32,
+    pub location: Location,
+    #[serde(rename = "containerName", default)]
+    pub container_name: Option<String>,
+}
+
 struct LspState {
     pending: HashMap<i64, Sender<Value>>,
     diagnostics: HashMap<String, Vec<Diagnostic>>,
@@ -292,6 +305,23 @@ impl LspClient {
         } else {
             Some(text)
         })
+    }
+
+    /// Run `workspace/symbol` with `query`. Returns the server's
+    /// (already fuzzy-ranked) candidate list. The caller filters by
+    /// `kind` if it only wants types — we keep the raw response so
+    /// MCP clients can pick their own slice.
+    pub fn workspace_symbol(&self, query: &str) -> Result<Vec<SymbolInformation>> {
+        let result = self.request(
+            "workspace/symbol",
+            json!({ "query": query }),
+            Duration::from_secs(10),
+        )?;
+        match result {
+            Value::Null => Ok(Vec::new()),
+            Value::Array(_) => Ok(serde_json::from_value(result)?),
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// Ask the server for the workspace edits required to rename the
