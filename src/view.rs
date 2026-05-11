@@ -135,4 +135,14 @@ impl View {
         }
         self.sticky_col = self.cursor_col;
     }
+
+    /// Jump the cursor to (line, col), clamped to the buffer's bounds.
+    /// `scroll_into_view` is the caller's responsibility — App::apply runs
+    /// it after every action.
+    pub fn goto(&mut self, buf: &Buffer, line: usize, col: usize) {
+        let last_line = buf.line_count().saturating_sub(1);
+        self.cursor_line = line.min(last_line);
+        self.cursor_col = col.min(buf.line_len_chars(self.cursor_line));
+        self.sticky_col = self.cursor_col;
+    }
 }

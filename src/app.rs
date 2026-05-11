@@ -10,6 +10,7 @@ use crate::action::Action;
 use crate::buffer::Buffer;
 use crate::git::{self, LineStatus};
 use crate::input;
+use crate::lsp::{self, LspClient};
 use crate::syntax::Syntax;
 use crate::tx::TxManager;
 use crate::ui;
@@ -25,6 +26,17 @@ pub struct App {
     /// working-tree file. Refreshed on save and at startup; empty when
     /// the file isn't in a git repo (or git isn't installed).
     pub git_status: HashMap<usize, LineStatus>,
+    /// `rust-analyzer` client when the seed file is Rust and the binary
+    /// is on PATH. `None` everywhere else (including non-Rust files and
+    /// failed spawns) — every consumer must tolerate absence.
+    pub lsp: Option<LspClient>,
+    pub lsp_uri: Option<String>,
+    /// True when LSP spawn was attempted (i.e., the file looked like Rust),
+    /// regardless of outcome. Combined with `lsp.is_some()` this lets the
+    /// UI render an Active / Failed / Hidden indicator without re-checking
+    /// the file extension.
+    pub lsp_attempted: bool,
+    lsp_version: i32,
     tx_manager: TxManager,
     quit_pending: bool,
 }
@@ -37,6 +49,7 @@ impl App {
             syn.refresh(&mut buffer);
         }
         let git_status = compute_git_status(buffer.path());
+        let (lsp, lsp_uri, lsp_attempted) = spawn_lsp(&buffer);
         Ok(Self {
             buffer,
             view: View::new(),
@@ -44,6 +57,10 @@ impl App {
             running: true,
             status: String::new(),
             git_status,
+            lsp,
+            lsp_uri,
+            lsp_attempted,
+            lsp_version: 0,
             tx_manager: TxManager::new(),
             quit_pending: false,
         })
@@ -144,6 +161,9 @@ impl App {
                     self.running = false;
                 }
             }
+            Action::GoToDefinition => {
+                self.status = self.go_to_definition();
+            }
         }
 
         // Close out the auto-tx. If the mutation didn't actually change
@@ -156,6 +176,7 @@ impl App {
                 self.tx_manager.discard(tx_id)?;
             } else {
                 self.tx_manager.commit(tx_id, &self.buffer)?;
+                self.notify_lsp_changed();
             }
         }
 
@@ -170,6 +191,68 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn notify_lsp_changed(&mut self) {
+        let Some(lsp) = self.lsp.as_ref() else { return };
+        let Some(uri) = self.lsp_uri.as_ref() else { return };
+        self.lsp_version += 1;
+        let text = self.buffer.rope().to_string();
+        let _ = lsp.did_change(uri, self.lsp_version, &text);
+    }
+
+    /// Resolve `textDocument/definition` at the cursor. Returns the
+    /// status-bar message — empty string means "moved cursor, no
+    /// message needed."
+    fn go_to_definition(&mut self) -> String {
+        let (Some(lsp), Some(uri)) = (self.lsp.as_ref(), self.lsp_uri.as_ref()) else {
+            return "LSP not available".into();
+        };
+        let line = self.view.cursor_line() as u32;
+        let character = self.view.cursor_col() as u32;
+        match lsp.definition(uri, line, character) {
+            Ok(locs) if locs.is_empty() => "No definition found".into(),
+            Ok(locs) => {
+                let loc = &locs[0];
+                if &loc.uri == uri {
+                    self.view.goto(
+                        &self.buffer,
+                        loc.range.start.line as usize,
+                        loc.range.start.character as usize,
+                    );
+                    String::new()
+                } else {
+                    // App is single-buffer; surface the target so the user
+                    // can open it themselves until multi-buffer lands.
+                    let path = loc.uri.strip_prefix("file://").unwrap_or(&loc.uri);
+                    format!(
+                        "Definition in {}:{}",
+                        path,
+                        loc.range.start.line as usize + 1,
+                    )
+                }
+            }
+            Err(e) => format!("Definition lookup failed: {e}"),
+        }
+    }
+}
+
+/// Returns `(client, uri, attempted)`. `attempted` is `true` whenever
+/// the file looked like Rust, so the UI can distinguish "spawn failed"
+/// (red badge) from "we didn't try" (no badge).
+fn spawn_lsp(buffer: &Buffer) -> (Option<LspClient>, Option<String>, bool) {
+    let Some(path) = buffer.path() else {
+        return (None, None, false);
+    };
+    if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+        return (None, None, false);
+    }
+    let uri = lsp::path_to_uri(path);
+    let workspace = lsp::workspace_root_for(path);
+    match LspClient::spawn_rust(&workspace, &uri, &buffer.rope().to_string()) {
+        Ok(client) => (Some(client), Some(uri), true),
+        // Fail-graceful: the TUI runs without LSP-backed features.
+        Err(_) => (None, None, true),
     }
 }
 
@@ -187,7 +270,8 @@ fn action_intent(action: &Action) -> Option<String> {
         | Action::PageUp
         | Action::PageDown
         | Action::Save
-        | Action::Quit => None,
+        | Action::Quit
+        | Action::GoToDefinition => None,
     }
 }
 

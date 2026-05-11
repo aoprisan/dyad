@@ -29,6 +29,7 @@ pub fn map(ev: KeyEvent) -> Option<Action> {
                 match c.to_ascii_lowercase() {
                     's' => Some(Action::Save),
                     'q' => Some(Action::Quit),
+                    ']' => Some(Action::GoToDefinition),
                     _ => None,
                 }
             } else if alt {

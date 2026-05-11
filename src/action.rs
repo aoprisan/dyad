@@ -13,4 +13,5 @@ pub enum Action {
     PageDown,
     Save,
     Quit,
+    GoToDefinition,
 }

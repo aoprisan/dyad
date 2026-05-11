@@ -158,17 +158,91 @@ fn render_status(frame: &mut Frame, rect: Rect, app: &App) {
         line = app.view.cursor_line() + 1,
         col = app.view.cursor_col() + 1,
     );
-    let right = format!(" {} ", app.status);
-    let bg = Style::default()
+    let bar = Style::default()
         .bg(Color::DarkGray)
         .fg(Color::White)
         .add_modifier(Modifier::BOLD);
-    // Pad to fill the row.
+    // Hints share the bar's bg/fg but drop BOLD so they sit a step quieter than the path.
+    let hint = Style::default().bg(Color::DarkGray).fg(Color::White);
+
+    // Right side precedence: transient status > current-line diagnostic > hints.
+    let (right_text, right_style) = if !app.status.is_empty() {
+        (format!(" {} ", app.status), bar)
+    } else if let Some((label, severity)) = current_line_diagnostic(app) {
+        let fg = match severity {
+            Some(1) => Color::Red,
+            Some(2) => Color::Yellow,
+            _ => Color::White,
+        };
+        let style = Style::default()
+            .bg(Color::DarkGray)
+            .fg(fg)
+            .add_modifier(Modifier::BOLD);
+        (label, style)
+    } else {
+        (HINT_TEXT.to_string(), hint)
+    };
+
+    // LSP badge sits between the left segment and the padding. Hidden for
+    // non-Rust files; green when alive; red when we tried and failed.
+    let lsp_badge = lsp_badge_span(app);
+
     let total_width = rect.width as usize;
-    let combined_len = left.chars().count() + right.chars().count();
+    let badge_len = lsp_badge.as_ref().map(|s| s.content.chars().count()).unwrap_or(0);
+    let combined_len = left.chars().count() + badge_len + right_text.chars().count();
     let pad = total_width.saturating_sub(combined_len);
-    let line = format!("{left}{:pad$}{right}", "", pad = pad);
-    frame.render_widget(Paragraph::new(line).style(bg), rect);
+    let mut spans = vec![Span::styled(left, bar)];
+    if let Some(badge) = lsp_badge {
+        spans.push(badge);
+    }
+    spans.push(Span::styled(" ".repeat(pad), bar));
+    spans.push(Span::styled(right_text, right_style));
+    frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+}
+
+/// Build the LSP indicator span. `None` when the file isn't a candidate
+/// for LSP (the user shouldn't be told something's missing that was never
+/// going to be there).
+fn lsp_badge_span(app: &App) -> Option<Span<'static>> {
+    if !app.lsp_attempted {
+        return None;
+    }
+    let (text, fg) = if app.lsp.is_some() {
+        ("lsp ", Color::Green)
+    } else {
+        // Tried and failed — most often rust-analyzer not on PATH.
+        ("lsp! ", Color::Red)
+    };
+    Some(Span::styled(
+        text,
+        Style::default()
+            .bg(Color::DarkGray)
+            .fg(fg)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+const HINT_TEXT: &str = " Ctrl-S save · Ctrl-] def · Ctrl-Q quit · Alt+h/j/k/l move ";
+
+/// First LSP diagnostic that starts on the cursor line, formatted for
+/// the status bar. Returns `(text, severity)` so the caller can colorize.
+fn current_line_diagnostic(app: &App) -> Option<(String, Option<u8>)> {
+    let lsp = app.lsp.as_ref()?;
+    let uri = app.lsp_uri.as_ref()?;
+    let cursor_line = app.view.cursor_line() as u32;
+    let diag = lsp
+        .diagnostics(uri)
+        .into_iter()
+        .find(|d| d.range.start.line == cursor_line)?;
+    let tag = match diag.severity {
+        Some(1) => "error",
+        Some(2) => "warn",
+        Some(3) => "info",
+        _ => "hint",
+    };
+    // Single-line: rust-analyzer sometimes embeds newlines.
+    let one_line = diag.message.replace('\n', " · ");
+    Some((format!(" {tag}: {one_line} "), diag.severity))
 }
 
 fn place_cursor(frame: &mut Frame, text_rect: Rect, app: &App) {
