@@ -114,3 +114,168 @@ pub fn map(ev: KeyEvent) -> Option<Action> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn release_events_are_ignored() {
+        let mut ev = key(KeyCode::Char('a'));
+        ev.kind = KeyEventKind::Release;
+        assert!(map(ev).is_none());
+    }
+
+    #[test]
+    fn plain_letter_inserts_itself() {
+        match map(key(KeyCode::Char('x'))).unwrap() {
+            Action::Insert(c) => assert_eq!(c, 'x'),
+            other => panic!("expected Insert('x'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_inserts_newline() {
+        match map(key(KeyCode::Enter)).unwrap() {
+            Action::Insert(c) => assert_eq!(c, '\n'),
+            other => panic!("expected Insert('\\n'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tab_inserts_tab_char() {
+        match map(key(KeyCode::Tab)).unwrap() {
+            Action::Insert(c) => assert_eq!(c, '\t'),
+            other => panic!("expected Insert('\\t'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_arrows_move_one_char() {
+        assert!(matches!(map(key(KeyCode::Left)).unwrap(), Action::MoveLeft));
+        assert!(matches!(map(key(KeyCode::Right)).unwrap(), Action::MoveRight));
+        assert!(matches!(map(key(KeyCode::Up)).unwrap(), Action::MoveUp));
+        assert!(matches!(map(key(KeyCode::Down)).unwrap(), Action::MoveDown));
+    }
+
+    #[test]
+    fn alt_left_right_jumps_words() {
+        let ev = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+        assert!(matches!(map(ev).unwrap(), Action::MoveWordLeft));
+        let ev = KeyEvent::new(KeyCode::Right, KeyModifiers::ALT);
+        assert!(matches!(map(ev).unwrap(), Action::MoveWordRight));
+    }
+
+    #[test]
+    fn home_end_pageup_pagedown_map() {
+        assert!(matches!(map(key(KeyCode::Home)).unwrap(), Action::MoveHome));
+        assert!(matches!(map(key(KeyCode::End)).unwrap(), Action::MoveEnd));
+        assert!(matches!(map(key(KeyCode::PageUp)).unwrap(), Action::PageUp));
+        assert!(matches!(
+            map(key(KeyCode::PageDown)).unwrap(),
+            Action::PageDown
+        ));
+    }
+
+    #[test]
+    fn backspace_and_delete_map_to_delete_prev_next() {
+        assert!(matches!(
+            map(key(KeyCode::Backspace)).unwrap(),
+            Action::DeletePrev
+        ));
+        assert!(matches!(
+            map(key(KeyCode::Delete)).unwrap(),
+            Action::DeleteNext
+        ));
+    }
+
+    #[test]
+    fn escape_maps_to_escape_action() {
+        assert!(matches!(map(key(KeyCode::Esc)).unwrap(), Action::Escape));
+    }
+
+    #[test]
+    fn f12_maps_to_go_to_definition() {
+        assert!(matches!(
+            map(key(KeyCode::F(12))).unwrap(),
+            Action::GoToDefinition
+        ));
+    }
+
+    #[test]
+    fn ctrl_letter_bindings_route_to_their_actions() {
+        let pairs: &[(char, Action)] = &[
+            ('s', Action::Save),
+            ('q', Action::Quit),
+            ('g', Action::GoToDefinition),
+            ('o', Action::GoBack),
+            ('t', Action::ToggleTree),
+            ('u', Action::PageUp),
+            ('d', Action::PageDown),
+            ('b', Action::MoveWordLeft),
+            ('f', Action::MoveWordRight),
+            ('a', Action::MoveHome),
+            ('e', Action::MoveEnd),
+            ('r', Action::ToggleGitDiff),
+            ('n', Action::NewFile),
+            ('w', Action::ToggleAutosave),
+            ('l', Action::ToggleHistory),
+            ('k', Action::ShowType),
+            ('y', Action::Rename),
+            ('p', Action::ToggleKeysHelp),
+            ('x', Action::OpenFile),
+        ];
+        for (c, expected) in pairs {
+            let got = map(ctrl(*c))
+                .unwrap_or_else(|| panic!("Ctrl-{c} produced no action"));
+            // Match by discriminant by using Debug format equality; the
+            // Action enum has no PartialEq so we compare formatted form.
+            assert_eq!(
+                format!("{got:?}"),
+                format!("{expected:?}"),
+                "Ctrl-{c} routed wrong"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_close_bracket_also_goes_to_definition() {
+        assert!(matches!(
+            map(ctrl(']')).unwrap(),
+            Action::GoToDefinition
+        ));
+    }
+
+    #[test]
+    fn alt_hjkl_act_as_directional_keys() {
+        assert!(matches!(map(alt('h')).unwrap(), Action::MoveLeft));
+        assert!(matches!(map(alt('l')).unwrap(), Action::MoveRight));
+        assert!(matches!(map(alt('k')).unwrap(), Action::MoveUp));
+        assert!(matches!(map(alt('j')).unwrap(), Action::MoveDown));
+    }
+
+    #[test]
+    fn alt_b_f_jump_word() {
+        assert!(matches!(map(alt('b')).unwrap(), Action::MoveWordLeft));
+        assert!(matches!(map(alt('f')).unwrap(), Action::MoveWordRight));
+    }
+
+    #[test]
+    fn unknown_ctrl_letter_returns_none() {
+        // No binding for Ctrl-Z today.
+        assert!(map(ctrl('z')).is_none());
+    }
+}

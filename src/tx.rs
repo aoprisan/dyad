@@ -233,4 +233,86 @@ mod tests {
         assert_eq!(recent[0].intent, "one");
         assert_eq!(recent[1].intent, "two");
     }
+
+    #[test]
+    fn recent_limit_respected() {
+        let mut buf = scratch_buffer("limit");
+        let mut tx = TxManager::new();
+        for i in 0..5 {
+            let id = tx.begin(format!("step {i}"), None, &buf);
+            buf.insert_str(buf.len_chars(), "x");
+            tx.commit(id, &buf).unwrap();
+        }
+        let recent = tx.recent(3);
+        assert_eq!(recent.len(), 3);
+        // Most-recent slice: steps 2, 3, 4.
+        assert_eq!(recent[0].intent, "step 2");
+        assert_eq!(recent[2].intent, "step 4");
+    }
+
+    #[test]
+    fn commit_assigns_ascending_change_ids() {
+        let mut buf = scratch_buffer("ids");
+        let mut tx = TxManager::new();
+        let id1 = tx.begin("a", None, &buf);
+        buf.insert_str(0, "a");
+        let c1 = tx.commit(id1, &buf).unwrap();
+        let id2 = tx.begin("b", None, &buf);
+        buf.insert_str(buf.len_chars(), "b");
+        let c2 = tx.commit(id2, &buf).unwrap();
+        // ChangeId is a transparent newtype; serialize to compare.
+        let s1 = serde_json::to_value(c1).unwrap();
+        let s2 = serde_json::to_value(c2).unwrap();
+        assert_eq!(s1.as_u64().unwrap() + 1, s2.as_u64().unwrap());
+    }
+
+    #[test]
+    fn pre_version_returns_buffer_version_at_begin() {
+        let mut buf = scratch_buffer("preversion");
+        buf.insert_str(0, "x"); // bumps version away from 0
+        let snapshot_version = buf.version();
+        let mut tx = TxManager::new();
+        let id = tx.begin("snap", None, &buf);
+        // Mutate further; pre_version should still reflect snapshot.
+        buf.insert_str(buf.len_chars(), "y");
+        assert_eq!(tx.pre_version(id), Some(snapshot_version));
+        // After commit it disappears from the active list.
+        tx.commit(id, &buf).unwrap();
+        assert_eq!(tx.pre_version(id), None);
+    }
+
+    #[test]
+    fn commit_with_unknown_id_errors() {
+        let buf = scratch_buffer("badcommit");
+        let mut tx = TxManager::new();
+        let real = tx.begin("real", None, &buf);
+        // Discard so `real` is no longer active.
+        tx.discard(real).unwrap();
+        let err = tx.commit(real, &buf).unwrap_err();
+        assert!(err.to_string().contains("unknown tx_id"));
+    }
+
+    #[test]
+    fn rollback_with_unknown_id_errors() {
+        let mut buf = scratch_buffer("badroll");
+        let mut tx = TxManager::new();
+        let real = tx.begin("real", None, &buf);
+        tx.discard(real).unwrap();
+        let err = tx.rollback(real, &mut buf).unwrap_err();
+        assert!(err.to_string().contains("unknown tx_id"));
+    }
+
+    #[test]
+    fn rollback_clears_dirty_when_snapshot_was_clean() {
+        let mut buf = scratch_buffer("clean_rollback");
+        // Snapshot taken before any edits — clean state.
+        assert!(!buf.is_dirty());
+        let mut tx = TxManager::new();
+        let id = tx.begin("rollback", None, &buf);
+        buf.insert_str(0, "edit");
+        assert!(buf.is_dirty());
+        tx.rollback(id, &mut buf).unwrap();
+        assert!(!buf.is_dirty());
+        assert_eq!(buf.rope().to_string(), "");
+    }
 }

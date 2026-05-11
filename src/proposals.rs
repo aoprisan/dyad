@@ -135,4 +135,66 @@ mod tests {
         assert!(q.take(id).is_none());
         assert_eq!(q.count(), 0);
     }
+
+    #[test]
+    fn new_queue_starts_empty() {
+        let q = ProposalQueue::new();
+        assert_eq!(q.count(), 0);
+        assert!(q.list().is_empty());
+    }
+
+    #[test]
+    fn list_returns_proposals_sorted_by_id() {
+        let mut q = ProposalQueue::new();
+        // Enqueue then drop the first one to force a gap; remaining items
+        // should still come back sorted by their (non-contiguous) ids.
+        let _a = q.enqueue(PendingProposal {
+            buffer_id: 1,
+            intent: "a".into(),
+            kind: ProposalKind::ReplaceRange { version: 0, start: 0, end: 0, text: "x".into() },
+        });
+        let b = q.enqueue(PendingProposal {
+            buffer_id: 1,
+            intent: "b".into(),
+            kind: ProposalKind::ReplaceRange { version: 0, start: 0, end: 0, text: "y".into() },
+        });
+        let c = q.enqueue(PendingProposal {
+            buffer_id: 1,
+            intent: "c".into(),
+            kind: ProposalKind::ReplaceRange { version: 0, start: 0, end: 0, text: "z".into() },
+        });
+        q.take(b);
+        let list = q.list();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].id < list[1].id);
+        assert_eq!(list[1].id, c);
+    }
+
+    #[test]
+    fn take_on_absent_id_returns_none() {
+        let mut q = ProposalQueue::new();
+        // Fabricate an id that was never issued.
+        assert!(q.take(ProposalId(999)).is_none());
+    }
+
+    #[test]
+    fn proposal_carries_buffer_id_and_intent() {
+        let mut q = ProposalQueue::new();
+        let id = q.enqueue(PendingProposal {
+            buffer_id: 7,
+            intent: "carry".into(),
+            kind: ProposalKind::ReplaceRange { version: 3, start: 0, end: 4, text: "abcd".into() },
+        });
+        let p = q.take(id).unwrap();
+        assert_eq!(p.buffer_id, 7);
+        assert_eq!(p.intent, "carry");
+        match p.kind {
+            ProposalKind::ReplaceRange { version, start, end, text } => {
+                assert_eq!(version, 3);
+                assert_eq!(start, 0);
+                assert_eq!(end, 4);
+                assert_eq!(text, "abcd");
+            }
+        }
+    }
 }

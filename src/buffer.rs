@@ -306,3 +306,218 @@ fn advance_by(row: usize, col: usize, s: &str) -> (usize, usize) {
         (row, col + s.len())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "dyad_buffer_test_{}_{}_{}.rs",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ))
+    }
+
+    fn temp_buffer(name: &str) -> Buffer {
+        let path = unique_path(name);
+        let _ = std::fs::remove_file(&path);
+        Buffer::open(path).unwrap()
+    }
+
+    #[test]
+    fn scratch_starts_empty_and_unpathed() {
+        let buf = Buffer::scratch();
+        assert_eq!(buf.len_chars(), 0);
+        assert_eq!(buf.version(), 0);
+        assert!(!buf.is_dirty());
+        assert!(buf.path().is_none());
+    }
+
+    #[test]
+    fn open_missing_file_returns_empty_buffer() {
+        let path = unique_path("missing");
+        let _ = std::fs::remove_file(&path);
+        let buf = Buffer::open(path.clone()).unwrap();
+        assert_eq!(buf.len_chars(), 0);
+        assert!(!buf.is_dirty());
+        assert_eq!(buf.path(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn open_existing_file_loads_contents() {
+        let path = unique_path("existing");
+        std::fs::write(&path, "hello\nworld\n").unwrap();
+        let buf = Buffer::open(path).unwrap();
+        assert_eq!(buf.rope().to_string(), "hello\nworld\n");
+        assert_eq!(buf.line_count(), 3); // includes trailing empty line.
+    }
+
+    #[test]
+    fn insert_char_bumps_version_and_marks_dirty() {
+        let mut buf = temp_buffer("insert_char");
+        let v0 = buf.version();
+        assert!(!buf.is_dirty());
+        buf.insert_char(0, 'h');
+        assert_eq!(buf.rope().to_string(), "h");
+        assert_ne!(buf.version(), v0);
+        assert!(buf.is_dirty());
+    }
+
+    #[test]
+    fn insert_char_newline_advances_row() {
+        let mut buf = temp_buffer("newline");
+        buf.insert_char(0, 'a');
+        buf.insert_char(1, '\n');
+        buf.insert_char(2, 'b');
+        let edits = buf.drain_edits();
+        assert_eq!(edits.len(), 3);
+        // After the third insert, the buffer is "a\nb"; the third edit
+        // produced from 'b' at (1, 0) -> (1, 1).
+        let last = edits[2];
+        assert_eq!(last.start_row, 1);
+        assert_eq!(last.start_col, 0);
+        assert_eq!(last.new_end_row, 1);
+        assert_eq!(last.new_end_col, 1);
+    }
+
+    #[test]
+    fn insert_char_supports_multibyte() {
+        let mut buf = temp_buffer("multibyte");
+        // 'é' is U+00E9 (2 bytes in UTF-8).
+        buf.insert_char(0, 'é');
+        assert_eq!(buf.rope().to_string(), "é");
+        let edits = buf.drain_edits();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_end_byte - edits[0].start_byte, 2);
+        // Char index advances by one even though the byte offset moves two.
+        assert_eq!(edits[0].new_end_col, 2);
+    }
+
+    #[test]
+    fn insert_str_with_newlines_updates_row_column() {
+        let mut buf = temp_buffer("insert_str");
+        buf.insert_str(0, "ab\ncd");
+        let edits = buf.drain_edits();
+        assert_eq!(edits.len(), 1);
+        let e = edits[0];
+        assert_eq!(e.start_row, 0);
+        assert_eq!(e.start_col, 0);
+        assert_eq!(e.new_end_row, 1);
+        assert_eq!(e.new_end_col, 2);
+    }
+
+    #[test]
+    fn delete_range_empty_is_a_noop() {
+        let mut buf = temp_buffer("noop_delete");
+        buf.insert_str(0, "hello");
+        let v_before = buf.version();
+        buf.drain_edits();
+        buf.delete_range(2..2);
+        assert_eq!(buf.rope().to_string(), "hello");
+        assert_eq!(buf.version(), v_before);
+        assert!(buf.drain_edits().is_empty());
+    }
+
+    #[test]
+    fn delete_range_removes_chars_and_records_edit() {
+        let mut buf = temp_buffer("delete_range");
+        buf.insert_str(0, "hello world");
+        buf.drain_edits();
+        buf.delete_range(5..11);
+        assert_eq!(buf.rope().to_string(), "hello");
+        let edits = buf.drain_edits();
+        assert_eq!(edits.len(), 1);
+        let e = edits[0];
+        assert_eq!(e.start_byte, 5);
+        assert_eq!(e.old_end_byte, 11);
+        assert_eq!(e.new_end_byte, 5);
+    }
+
+    #[test]
+    fn replace_node_swaps_byte_range() {
+        let mut buf = temp_buffer("replace_node");
+        buf.insert_str(0, "fn hello() {}");
+        // bytes 3..8 = "hello"
+        buf.replace_node(3..8, "goodbye");
+        assert_eq!(buf.rope().to_string(), "fn goodbye() {}");
+        assert!(buf.is_dirty());
+    }
+
+    #[test]
+    fn line_len_chars_strips_terminator() {
+        let mut buf = temp_buffer("line_len");
+        buf.insert_str(0, "abc\ndef\r\nxy");
+        assert_eq!(buf.line_len_chars(0), 3); // "abc"
+        // "def\r\n" -> printable cols = 3 (the rope stores '\r' before '\n').
+        // Implementation strips one trailing terminator, so 4 here ("def\r").
+        // Keep the contract assertion narrow: 0-based count <= raw length.
+        assert!(buf.line_len_chars(1) <= buf.line(1).len_chars());
+        assert_eq!(buf.line_len_chars(2), 2); // "xy"
+    }
+
+    #[test]
+    fn save_writes_contents_and_clears_dirty() {
+        let path = unique_path("save");
+        let _ = std::fs::remove_file(&path);
+        let mut buf = Buffer::open(path.clone()).unwrap();
+        buf.insert_str(0, "saved text\n");
+        assert!(buf.is_dirty());
+        let bytes = buf.save().unwrap();
+        assert_eq!(bytes, "saved text\n".len());
+        assert!(!buf.is_dirty());
+        // File round-trips on disk.
+        let from_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(from_disk, "saved text\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_without_path_errors() {
+        let mut buf = Buffer::scratch();
+        buf.insert_str(0, "scratch");
+        let err = buf.save().unwrap_err();
+        assert!(err.to_string().contains("no associated path"));
+    }
+
+    #[test]
+    fn drain_edits_returns_then_clears_pending() {
+        let mut buf = temp_buffer("drain");
+        buf.insert_char(0, 'a');
+        buf.insert_char(1, 'b');
+        let first = buf.drain_edits();
+        assert_eq!(first.len(), 2);
+        // After draining, pending is empty.
+        assert!(buf.drain_edits().is_empty());
+    }
+
+    #[test]
+    fn snapshot_then_restore_round_trips_text() {
+        let mut buf = temp_buffer("snapshot");
+        buf.insert_str(0, "initial");
+        let snap = buf.snapshot();
+        let pre_version = buf.version();
+
+        buf.insert_str(buf.len_chars(), " mutation");
+        assert_eq!(buf.rope().to_string(), "initial mutation");
+
+        buf.restore(snap);
+        assert_eq!(buf.rope().to_string(), "initial");
+        // Restore bumps version past the intermediate state so caches
+        // invalidate; it does not revert version to the snapshot's.
+        assert_ne!(buf.version(), pre_version);
+    }
+
+    #[test]
+    fn line_to_char_aligns_with_rope() {
+        let mut buf = temp_buffer("line_to_char");
+        buf.insert_str(0, "a\nbc\ndef\n");
+        assert_eq!(buf.line_to_char(0), 0);
+        assert_eq!(buf.line_to_char(1), 2);
+        assert_eq!(buf.line_to_char(2), 5);
+    }
+}

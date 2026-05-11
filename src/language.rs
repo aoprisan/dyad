@@ -121,3 +121,70 @@ impl Language {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn for_path_recognizes_rust_extension() {
+        assert_eq!(Language::for_path(&PathBuf::from("foo.rs")), Some(Language::Rust));
+    }
+
+    #[test]
+    fn for_path_routes_all_scala_filetypes_to_scala() {
+        for ext in ["scala", "sc", "sbt"] {
+            let p = PathBuf::from(format!("foo.{ext}"));
+            assert_eq!(Language::for_path(&p), Some(Language::Scala), "{ext}");
+        }
+    }
+
+    #[test]
+    fn for_path_returns_none_for_unknown_extensions() {
+        assert!(Language::for_path(&PathBuf::from("README.md")).is_none());
+        assert!(Language::for_path(&PathBuf::from("noext")).is_none());
+    }
+
+    #[test]
+    fn descriptor_strings_are_stable_and_non_empty() {
+        for lang in [Language::Rust, Language::Scala] {
+            assert!(!lang.display_name().is_empty());
+            assert!(!lang.lsp_binary().is_empty());
+            assert!(!lang.lsp_language_id().is_empty());
+            assert!(!lang.install_hint().is_empty());
+            assert!(!lang.workspace_markers().is_empty());
+            assert!(lang.initialize_timeout().as_secs() > 0);
+        }
+    }
+
+    #[test]
+    fn workspace_markers_match_per_language() {
+        assert_eq!(Language::Rust.workspace_markers(), &["Cargo.toml"]);
+        let scala_markers = Language::Scala.workspace_markers();
+        assert!(scala_markers.contains(&"build.sbt"));
+    }
+
+    #[test]
+    fn capability_flags_match_language() {
+        // Rust advertises rust-analyzer status; Scala does not.
+        assert!(Language::Rust.advertises_rust_analyzer_server_status());
+        assert!(!Language::Scala.advertises_rust_analyzer_server_status());
+
+        // Both track indexing status.
+        assert!(Language::Rust.tracks_indexing_status());
+        assert!(Language::Scala.tracks_indexing_status());
+
+        // Only Rust has the type-from-source-line fallback.
+        assert!(Language::Rust.supports_type_from_source_line());
+        assert!(!Language::Scala.supports_type_from_source_line());
+    }
+
+    #[test]
+    fn initialization_options_present_only_for_scala() {
+        assert!(Language::Rust.initialization_options().is_none());
+        let opts = Language::Scala.initialization_options().unwrap();
+        assert_eq!(opts["isHttpEnabled"], false);
+        assert_eq!(opts["statusBarProvider"], "on");
+    }
+}
