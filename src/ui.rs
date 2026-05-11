@@ -327,11 +327,11 @@ const KEYS_HELP: &[KeyRow] = &[
     KeyRow::Binding("Ctrl-W", "toggle autosave (~500ms idle)"),
     KeyRow::Binding("Ctrl-Q", "quit (twice when dirty)"),
     KeyRow::Section("LSP"),
-    KeyRow::Binding("Ctrl-G", "go to definition"),
+    KeyRow::Binding("Ctrl-G then …", "go prefix: d/g=def, t=type, l/v=line, b=back"),
     KeyRow::Binding("Ctrl-O", "back (nav stack)"),
     KeyRow::Binding("Ctrl-K", "show type at cursor"),
     KeyRow::Binding("Ctrl-Y", "rename symbol"),
-    KeyRow::Binding("Alt-T", "find type (workspace symbol)"),
+    KeyRow::Binding("Ctrl-V", "go to line (visit; number prompt)"),
     KeyRow::Section("Motion"),
     KeyRow::Binding("Arrows / Alt+hjkl", "move by char / line"),
     KeyRow::Binding("Ctrl-B / Ctrl-F", "word left / right (Alt+b/f also)"),
@@ -721,7 +721,7 @@ fn lsp_badge_span(app: &App) -> Option<Span<'static>> {
 }
 
 const HINT_TEXT: &str =
-    " Ctrl-P keys · Ctrl-X open · Alt-T type · Ctrl-T tree · Ctrl-K hover · Ctrl-R git · Ctrl-S save ";
+    " Ctrl-P keys · Ctrl-X open · Ctrl-G,T type · Ctrl-V goto · Ctrl-T tree · Ctrl-K hover · Ctrl-R git · Ctrl-S save ";
 
 const KEYS_HINT_TEXT: &str = " Esc close · Ctrl-P toggle ";
 

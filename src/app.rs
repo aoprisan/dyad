@@ -87,6 +87,18 @@ pub struct App {
     /// file, and the repo root we resolved when the overlay opened
     /// (so navigation doesn't re-shell `rev-parse` for every key).
     pub diff: Option<GitView>,
+    /// Pending chord prefix. `Some(Chord::CtrlG)` after the user
+    /// presses Ctrl-G; the next keystroke is consumed by
+    /// `resolve_chord` to pick a destination. Cleared on any
+    /// keystroke whether it matches a chord arm or not.
+    pub chord: Option<Chord>,
+}
+
+#[derive(Clone, Copy)]
+pub enum Chord {
+    /// Ctrl-G prefix: g/d = go-to-def, t = find type, l/v = go to line,
+    /// b = back. Anything else (incl. Esc) silently cancels.
+    CtrlG,
 }
 
 pub struct Prompt {
@@ -107,6 +119,8 @@ pub enum PromptKind {
     /// to the symbol the user actually wanted to rename, even if they
     /// move the cursor while typing into the prompt.
     RenameSymbol { line: u32, character: u32 },
+    /// Jump to a 1-based line number typed by the user.
+    GoToLine,
 }
 
 pub struct OpenFileView {
@@ -245,6 +259,7 @@ impl App {
             quit_pending: false,
             tree: FileTree::new(tree_root),
             diff: None,
+            chord: None,
             history: None,
             keys_help: false,
             open_file: None,
@@ -277,6 +292,7 @@ impl App {
             quit_pending: false,
             tree,
             diff: None,
+            chord: None,
             history: None,
             keys_help: false,
             open_file: None,
@@ -338,6 +354,15 @@ impl App {
     }
 
     fn apply(&mut self, action: Action) -> Result<()> {
+        // Chord prefix consumes the very next keystroke. Resolution
+        // happens before every other routing — while a chord is
+        // pending, no modal, prompt, or edit can fire. resolve_chord
+        // clears the chord and may dispatch a follow-up action via a
+        // recursive apply call.
+        if let Some(chord) = self.chord {
+            return self.resolve_chord(chord, action);
+        }
+
         // Any non-Quit input clears the pending-quit confirmation.
         if !matches!(action, Action::Quit) {
             self.quit_pending = false;
@@ -390,6 +415,16 @@ impl App {
             }
             Action::NewFile => {
                 self.start_new_file_prompt();
+                return Ok(());
+            }
+            Action::GoToLine => {
+                self.start_goto_line_prompt();
+                return Ok(());
+            }
+            Action::CtrlGPrefix => {
+                self.chord = Some(Chord::CtrlG);
+                self.status =
+                    "Ctrl-G: g/d=def · t=type · l/v=line · b=back · Esc cancels".into();
                 return Ok(());
             }
             Action::ToggleAutosave => {
@@ -542,6 +577,8 @@ impl App {
             | Action::OpenFile
             | Action::OpenTypeSearch
             | Action::NewFile
+            | Action::GoToLine
+            | Action::CtrlGPrefix
             | Action::ToggleAutosave
             | Action::Escape => {}
             // Listed for exhaustiveness — `ShowType`/`Rename` are
@@ -1016,6 +1053,79 @@ impl App {
             PromptKind::RenameSymbol { line, character } => {
                 self.do_rename(line, character, prompt.buffer)
             }
+            PromptKind::GoToLine => {
+                self.do_goto_line(prompt.buffer);
+                Ok(())
+            }
+        }
+    }
+
+    /// Resolve the keystroke that follows a chord prefix. The chord
+    /// state is cleared up-front so a recursive `apply` call lands in
+    /// the normal routing path. Any arm we don't recognise (including
+    /// Esc and any other modifier-bearing key) silently cancels — we
+    /// deliberately do not let the cancelling key fall through and
+    /// fire its normal action, since the user pressed Ctrl-G to
+    /// disambiguate and we'd rather they retry than accidentally
+    /// trigger a mutation.
+    fn resolve_chord(&mut self, chord: Chord, action: Action) -> Result<()> {
+        self.chord = None;
+        self.status.clear();
+        let resolved = match chord {
+            Chord::CtrlG => match action {
+                // Vim-style "gg" (Ctrl-G Ctrl-G) and the explicit "d"
+                // arm both fire go-to-definition. The plain letter
+                // forms come through as `Insert` because chord arms
+                // are pressed without a modifier.
+                Action::CtrlGPrefix => Some(Action::GoToDefinition),
+                Action::Insert('g' | 'G' | 'd' | 'D') => Some(Action::GoToDefinition),
+                Action::Insert('t' | 'T') => Some(Action::OpenTypeSearch),
+                Action::Insert('l' | 'L' | 'v' | 'V') => Some(Action::GoToLine),
+                Action::Insert('b' | 'B') => Some(Action::GoBack),
+                _ => None,
+            },
+        };
+        if let Some(a) = resolved {
+            self.apply(a)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Ctrl-V ("visit line") — also reachable via the Ctrl-G prefix
+    /// (Ctrl-G then L or V). Prompts for a 1-based line number and
+    /// jumps to it. Alt-G and Ctrl-Shift-G are silent fallbacks in
+    /// `input::map` for terminals that deliver them.
+    fn start_goto_line_prompt(&mut self) {
+        if self.prompt.is_some() {
+            return;
+        }
+        self.prompt = Some(Prompt {
+            label: "Go to line:",
+            buffer: String::new(),
+            kind: PromptKind::GoToLine,
+        });
+    }
+
+    fn do_goto_line(&mut self, input: String) {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let parsed: Option<usize> = trimmed.parse().ok();
+        let Some(n) = parsed else {
+            self.status = format!("Not a line number: {trimmed}");
+            return;
+        };
+        if n == 0 {
+            self.status = "Line numbers start at 1".into();
+            return;
+        }
+        let last_line = self.buffer.line_count().saturating_sub(1);
+        let target = (n - 1).min(last_line);
+        self.view.goto(&self.buffer, target, 0);
+        if target + 1 != n {
+            self.status = format!("Clamped to last line ({})", target + 1);
         }
     }
 
@@ -1929,7 +2039,9 @@ fn action_intent(action: &Action) -> Option<String> {
         | Action::Save
         | Action::Quit
         | Action::GoToDefinition
+        | Action::GoToLine
         | Action::GoBack
+        | Action::CtrlGPrefix
         | Action::ToggleTree
         | Action::ToggleGitDiff
         | Action::ToggleHistory

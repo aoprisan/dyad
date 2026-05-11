@@ -10,6 +10,7 @@ pub fn map(ev: KeyEvent) -> Option<Action> {
 
     let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
     let alt = ev.modifiers.contains(KeyModifiers::ALT);
+    let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
 
     match ev.code {
         // Option+Left/Right on macOS: jump word boundaries (macOS
@@ -33,15 +34,38 @@ pub fn map(ev: KeyEvent) -> Option<Action> {
         // terminals than Ctrl-] (kept below for terminals that route it).
         KeyCode::F(12) => Some(Action::GoToDefinition),
         KeyCode::Char(c) => {
+            // Ctrl+Shift+letter is the preferred secondary slot for new
+            // bindings (see MEMORY: feedback_tui_keybindings). Only
+            // terminals that speak CSI-u / kitty keyboard protocol
+            // (kitty, WezTerm, recent iTerm2 with the option on) report
+            // SHIFT alongside CONTROL; on terminals that collapse it,
+            // these fall through to the plain Ctrl+letter match below.
+            if ctrl
+                && shift
+                && let Some(action) = match c.to_ascii_lowercase() {
+                    // Ctrl-Shift-G ("go to line"): pairs with Ctrl-G
+                    // (go to definition). Mnemonic: same letter, more
+                    // modifier = more deliberate jump.
+                    'g' => Some(Action::GoToLine),
+                    // Ctrl-Shift-T ("find type"): workspace symbol
+                    // search. Alt-T is kept as a silent fallback below.
+                    't' => Some(Action::OpenTypeSearch),
+                    _ => None,
+                }
+            {
+                return Some(action);
+            }
             if ctrl {
                 match c.to_ascii_lowercase() {
                     's' => Some(Action::Save),
                     'q' => Some(Action::Quit),
-                    // Ctrl-G ("go") is the primary go-to-definition key —
-                    // single-letter Ctrl bindings route cleanly on macOS
-                    // terminals where F12 needs `fn` and Ctrl-] often
-                    // loses its modifier.
-                    'g' => Some(Action::GoToDefinition),
+                    // Ctrl-G ("go") opens the chord prefix — the next
+                    // keystroke picks a destination (see
+                    // `App::resolve_chord`): g/d = go-to-def, t = find
+                    // type, l/v = line, b = back. F12 and Ctrl-] keep
+                    // their direct go-to-def behavior as escape
+                    // hatches for power users.
+                    'g' => Some(Action::CtrlGPrefix),
                     ']' => Some(Action::GoToDefinition),
                     // Ctrl-O ("older") — vim convention for the back side
                     // of the navigation stack.
@@ -89,6 +113,13 @@ pub fn map(ev: KeyEvent) -> Option<Action> {
                     // against every non-hidden file under the root;
                     // Up/Down picks, Enter opens, Esc cancels.
                     'x' => Some(Action::OpenFile),
+                    // Ctrl-V ("visit line"): prompt for a 1-based
+                    // line number and jump. The Ctrl-Shift-G slot
+                    // above is the kitty-protocol primary; Ctrl-V is
+                    // the universal fallback because every other
+                    // single Ctrl-letter is either bound or eaten
+                    // by the terminal (C/H/I/J/M/Z).
+                    'v' => Some(Action::GoToLine),
                     _ => None,
                 }
             } else if alt {
@@ -105,10 +136,13 @@ pub fn map(ev: KeyEvent) -> Option<Action> {
                     // in terminals that do forward modified arrows.
                     'b' => Some(Action::MoveWordLeft),
                     'f' => Some(Action::MoveWordRight),
-                    // Alt-T ("type"): open the workspace type-search
-                    // dialog — fuzzy-match struct/enum/trait names
-                    // across the workspace via LSP `workspace/symbol`.
+                    // Alt-T / Alt-G are silent fallbacks for terminals
+                    // that don't deliver Ctrl-Shift+letter (most macOS
+                    // setups don't speak CSI-u). The primary bindings
+                    // for these actions are Ctrl-Shift-T / Ctrl-Shift-G
+                    // — see the `if ctrl && shift` block above.
                     't' => Some(Action::OpenTypeSearch),
+                    'g' => Some(Action::GoToLine),
                     _ => None,
                 }
             } else {
@@ -224,7 +258,7 @@ mod tests {
         let pairs: &[(char, Action)] = &[
             ('s', Action::Save),
             ('q', Action::Quit),
-            ('g', Action::GoToDefinition),
+            ('g', Action::CtrlGPrefix),
             ('o', Action::GoBack),
             ('t', Action::ToggleTree),
             ('u', Action::PageUp),
@@ -241,6 +275,7 @@ mod tests {
             ('y', Action::Rename),
             ('p', Action::ToggleKeysHelp),
             ('x', Action::OpenFile),
+            ('v', Action::GoToLine),
         ];
         for (c, expected) in pairs {
             let got = map(ctrl(*c))
@@ -283,8 +318,43 @@ mod tests {
     }
 
     #[test]
+    fn alt_g_opens_goto_line() {
+        assert!(matches!(map(alt('g')).unwrap(), Action::GoToLine));
+    }
+
+    fn ctrl_shift(c: char) -> KeyEvent {
+        KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )
+    }
+
+    #[test]
+    fn ctrl_shift_g_opens_goto_line() {
+        // Terminals that speak CSI-u report SHIFT alongside CONTROL;
+        // on terminals that collapse it, the event arrives as plain
+        // Ctrl+G and falls through to GoToDefinition (covered by
+        // `ctrl_letter_bindings_route_to_their_actions`).
+        assert!(matches!(map(ctrl_shift('G')).unwrap(), Action::GoToLine));
+        assert!(matches!(map(ctrl_shift('g')).unwrap(), Action::GoToLine));
+    }
+
+    #[test]
+    fn ctrl_shift_t_opens_type_search() {
+        assert!(matches!(
+            map(ctrl_shift('T')).unwrap(),
+            Action::OpenTypeSearch
+        ));
+        assert!(matches!(
+            map(ctrl_shift('t')).unwrap(),
+            Action::OpenTypeSearch
+        ));
+    }
+
+    #[test]
     fn unknown_ctrl_letter_returns_none() {
-        // No binding for Ctrl-Z today.
+        // No binding for Ctrl-Z today. (Reserved for a likely future
+        // undo binding — see DESIGN.md transactions.)
         assert!(map(ctrl('z')).is_none());
     }
 }

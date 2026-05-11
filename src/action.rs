@@ -16,7 +16,11 @@ pub enum Action {
     Save,
     Quit,
     GoToDefinition,
+    GoToLine,
     GoBack,
+    /// Ctrl-G — enter the "go" chord prefix. The next keystroke
+    /// resolves to a destination (see `App::resolve_chord`).
+    CtrlGPrefix,
     ShowType,
     Rename,
     ToggleTree,
