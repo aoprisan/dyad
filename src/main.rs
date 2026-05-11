@@ -9,6 +9,7 @@ mod buffer;
 mod input;
 mod syntax;
 mod terminal;
+mod tx;
 mod ui;
 mod view;
 

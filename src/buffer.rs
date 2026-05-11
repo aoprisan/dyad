@@ -33,6 +33,21 @@ pub struct Buffer {
     pending_edits: Vec<Edit>,
 }
 
+/// Frozen Buffer state captured at `Buffer::snapshot` time. Phase 3 stores
+/// one of these inside each active transaction so `tx.rollback` can put
+/// the buffer back to where it was when the transaction began.
+///
+/// Fields stay private — the only legal way to apply a snapshot is via
+/// `Buffer::restore`, which also bumps the version so any downstream
+/// cache (e.g. the syntax tree) invalidates.
+#[derive(Clone, Debug)]
+pub struct BufferSnapshot {
+    rope: Rope,
+    version: u64,
+    dirty: bool,
+    pending_edits: Vec<Edit>,
+}
+
 impl Buffer {
     pub fn open(path: PathBuf) -> Result<Self> {
         let rope = match File::open(&path) {
@@ -211,6 +226,37 @@ impl Buffer {
     /// a borrow on the Buffer during the reparse.
     pub fn drain_edits(&mut self) -> Vec<Edit> {
         std::mem::take(&mut self.pending_edits)
+    }
+
+    /// Snapshot the mutable buffer state so a transaction can roll back
+    /// to it later. The clone is cheap — ropey's tree is shared via Arc,
+    /// so only the structural delta gets copied on subsequent writes.
+    pub fn snapshot(&self) -> BufferSnapshot {
+        BufferSnapshot {
+            rope: self.rope.clone(),
+            version: self.version,
+            dirty: self.dirty,
+            pending_edits: self.pending_edits.clone(),
+        }
+    }
+
+    /// Restore a snapshot taken via `snapshot`. Version bumps past its
+    /// current value (rather than reverting) so any cache that saw the
+    /// intermediate state — most notably the syntax tree — re-runs on
+    /// the next refresh.
+    ///
+    /// NB: rolling back while the syntax cache holds a tree from the
+    /// rolled-back side leaves that tree mismatched with the rope. Until
+    /// Phase 4 wires App-level rollback (which can call
+    /// `Syntax::invalidate`), only call this from contexts where syntax
+    /// gets a clean re-run (e.g., in tests, or via a future App helper).
+    pub fn restore(&mut self, snap: BufferSnapshot) {
+        self.rope = snap.rope;
+        self.version = self.version.wrapping_add(1);
+        self.dirty = snap.dirty;
+        self.pending_edits = snap.pending_edits;
+        // snap.version is intentionally unused — see the doc comment.
+        let _ = snap.version;
     }
 
     fn byte_row_col_at_char(&self, char_idx: usize) -> (usize, usize, usize) {

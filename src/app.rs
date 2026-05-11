@@ -9,6 +9,7 @@ use crate::action::Action;
 use crate::buffer::Buffer;
 use crate::input;
 use crate::syntax::Syntax;
+use crate::tx::TxManager;
 use crate::ui;
 use crate::view::View;
 
@@ -18,6 +19,7 @@ pub struct App {
     pub syntax: Option<Syntax>,
     pub running: bool,
     pub status: String,
+    tx_manager: TxManager,
     quit_pending: bool,
 }
 
@@ -34,6 +36,7 @@ impl App {
             syntax,
             running: true,
             status: String::new(),
+            tx_manager: TxManager::new(),
             quit_pending: false,
         })
     }
@@ -69,6 +72,14 @@ impl App {
         if !matches!(action, Action::Quit) {
             self.quit_pending = false;
         }
+
+        // Open an auto-tx for buffer-mutating actions so every edit lands
+        // in the flat history with a human-readable intent (DESIGN.md
+        // §Transactions & intent). Movement, save, and quit aren't edits
+        // and don't get wrapped.
+        let tx_id = action_intent(&action)
+            .map(|intent| self.tx_manager.begin(intent, None, &self.buffer));
+        let pre_version = tx_id.and_then(|id| self.tx_manager.pre_version(id));
 
         match action {
             Action::Insert(c) => {
@@ -124,6 +135,19 @@ impl App {
             }
         }
 
+        // Close out the auto-tx. If the mutation didn't actually change
+        // the rope (e.g., DeletePrev at the start of the buffer), drop
+        // it without recording a history entry — pre_version comparison
+        // is the test of record because Buffer::touch bumps version on
+        // every real mutation.
+        if let Some(tx_id) = tx_id {
+            if Some(self.buffer.version()) == pre_version {
+                self.tx_manager.discard(tx_id)?;
+            } else {
+                self.tx_manager.commit(tx_id, &self.buffer)?;
+            }
+        }
+
         // Scroll-into-view after every action. We re-query the terminal height; the next draw
         // will adjust if it changes.
         let rows = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
@@ -135,5 +159,33 @@ impl App {
         }
 
         Ok(())
+    }
+}
+
+fn action_intent(action: &Action) -> Option<String> {
+    match action {
+        Action::Insert(c) => Some(format!("insert {}", describe_char(*c))),
+        Action::DeletePrev => Some("delete backward".into()),
+        Action::DeleteNext => Some("delete forward".into()),
+        Action::MoveLeft
+        | Action::MoveRight
+        | Action::MoveUp
+        | Action::MoveDown
+        | Action::MoveHome
+        | Action::MoveEnd
+        | Action::PageUp
+        | Action::PageDown
+        | Action::Save
+        | Action::Quit => None,
+    }
+}
+
+fn describe_char(c: char) -> String {
+    match c {
+        '\n' => "newline".into(),
+        '\t' => "tab".into(),
+        ' ' => "space".into(),
+        c if c.is_ascii_graphic() => format!("'{c}'"),
+        c => format!("U+{:04X}", c as u32),
     }
 }
