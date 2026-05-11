@@ -195,13 +195,19 @@ cargo build --release && scripts/mcp-smoke.sh
 Known scope limits in this iteration:
 - One buffer per `--mcp` invocation; `buffer.open` is implicit from the
   CLI path.
-- `symbol.definition` and `diag.current` require `rust-analyzer` on
-  `PATH`. Install with `rustup component add rust-analyzer` (or `brew
-  install rust-analyzer`). Without it the LSP tools return an error
-  but every other tool still works.
-- No `view.*`, `symbol.references`, `symbol.signature`, or `note.pin`
-  yet — Phase 6 only ships the minimum LSP surface (definition +
-  diagnostics); the rest comes later in Phase 6/7.
+- `symbol.definition`, `diag.current`, and `edit.rename_symbol`
+  require `rust-analyzer` on `PATH`. Install with `rustup component
+  add rust-analyzer` (or `brew install rust-analyzer`). Without it
+  the LSP tools return an error but every other tool still works.
+- `edit.rename_symbol` only applies edits to the buffer currently
+  open by this `--mcp` invocation. Cross-file rename targets come
+  back in `skipped_files`; re-run dyad against each file (or wait for
+  Phase 8 multi-buffer) to apply them. LSP positions are line +
+  UTF-16 code units — exact for BMP-only source, off-by-one per
+  non-BMP code point.
+- No `view.*`, `symbol.references`, `symbol.signature`,
+  `edit.extract_function`, `edit.add_import`, `edit.inline`, or
+  `note.pin` yet.
 - Edits without an explicit `tx.begin` auto-open + auto-commit a
   one-shot transaction with a synthetic intent string. Multi-step
   refactors should call `tx.begin("rename X for clarity")` first.

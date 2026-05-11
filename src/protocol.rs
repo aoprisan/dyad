@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::buffer::Buffer;
-use crate::lsp::{self, Diagnostic, Location, LspClient};
+use crate::lsp::{self, Diagnostic, Location, LspClient, TextEdit};
 use crate::syntax::{AstMatch, Syntax};
 use crate::tx::{Change, ChangeId, TxId, TxManager};
 
@@ -48,6 +48,17 @@ pub struct BufferEntry {
     pub path: Option<String>,
     pub dirty: bool,
     pub version: u64,
+}
+
+/// Outcome of `edit_rename_symbol`. `applied` counts the in-buffer
+/// edits we successfully wrote; `skipped_files` are the other URIs the
+/// LSP server wanted to touch but which aren't loaded as `dyad`'s
+/// active buffer. The agent must re-target those separately.
+#[derive(Clone, Debug, Serialize)]
+pub struct RenameResult {
+    pub applied: usize,
+    pub new_version: u64,
+    pub skipped_files: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -300,6 +311,90 @@ impl ProtocolState {
         Ok(lsp.diagnostics(uri))
     }
 
+    /// Phase 7 tier-3 edit: ask the LSP server for the workspace edits
+    /// required to rename the symbol at `(line, character)` to
+    /// `new_name`, then apply the in-buffer subset as a single
+    /// transaction. Cross-file edits aren't applied here — they come
+    /// back in `skipped_files` so the caller can re-target via another
+    /// `--mcp` invocation (Phase 8 brings real multi-buffer).
+    ///
+    /// LSP positions are line + UTF-16 code units. dyad's rope is char
+    /// indexed (Unicode scalar values), so this conversion is exact
+    /// for BMP-only source — which covers nearly all Rust code. Files
+    /// with non-BMP characters (rare emoji-in-string-literal cases)
+    /// will mis-position; that's a known limitation here.
+    pub fn edit_rename_symbol(
+        &mut self,
+        buffer_id: u64,
+        version: u64,
+        line: u32,
+        character: u32,
+        new_name: String,
+    ) -> Result<RenameResult> {
+        self.check_buffer(buffer_id)?;
+        self.check_version(version)?;
+        let lsp = self
+            .lsp
+            .as_ref()
+            .context("rust-analyzer not running (see `rustup component add rust-analyzer`)")?;
+        let uri = self
+            .buffer_uri
+            .as_ref()
+            .context("buffer has no file URI; cannot query LSP")?
+            .clone();
+
+        let workspace_edit = lsp.rename(&uri, line, character, &new_name)?;
+        let mut in_buffer = workspace_edit
+            .changes
+            .get(&uri)
+            .cloned()
+            .unwrap_or_default();
+        let skipped_files: Vec<String> = workspace_edit
+            .changes
+            .keys()
+            .filter(|k| **k != uri)
+            .cloned()
+            .collect();
+
+        if in_buffer.is_empty() {
+            return Ok(RenameResult {
+                applied: 0,
+                new_version: self.buffer.version(),
+                skipped_files,
+            });
+        }
+
+        // Apply end-to-start so earlier edits don't shift later ranges.
+        in_buffer.sort_by(|a, b| {
+            (
+                b.range.start.line,
+                b.range.start.character,
+                b.range.end.line,
+                b.range.end.character,
+            )
+                .cmp(&(
+                    a.range.start.line,
+                    a.range.start.character,
+                    a.range.end.line,
+                    a.range.end.character,
+                ))
+        });
+
+        let edits_for_intent = in_buffer.clone();
+        self.with_auto_tx(
+            || format!("edit.rename_symbol -> {new_name}"),
+            move |s| apply_text_edits(&mut s.buffer, &edits_for_intent),
+        )?;
+        self.refresh_syntax();
+        self.notify_lsp_changed();
+
+        Ok(RenameResult {
+            applied: in_buffer.len(),
+            new_version: self.buffer.version(),
+            skipped_files,
+        })
+    }
+
     // ---------- Read-only accessors (for tests + transport) ----------
 
     #[allow(dead_code)] // Used by tests; an MCP `buffer.version` tool can wrap it later.
@@ -372,6 +467,51 @@ impl ProtocolState {
             let _ = lsp.did_change(uri, self.lsp_version, &text);
         }
     }
+}
+
+/// Apply a list of LSP `TextEdit`s to a buffer. Caller is responsible
+/// for sorting the edits end-to-start so earlier indices stay valid
+/// (we don't sort here so the caller's intent — including pre-sorted
+/// inputs from tests — is preserved).
+fn apply_text_edits(buffer: &mut Buffer, edits: &[TextEdit]) -> Result<()> {
+    for edit in edits {
+        let start = lsp_pos_to_char(buffer, edit.range.start.line, edit.range.start.character)?;
+        let end = lsp_pos_to_char(buffer, edit.range.end.line, edit.range.end.character)?;
+        if start < end {
+            buffer.delete_range(start..end);
+        }
+        if !edit.new_text.is_empty() {
+            buffer.insert_str(start, &edit.new_text);
+        }
+    }
+    Ok(())
+}
+
+/// Convert an LSP `(line, character)` position into a rope char index.
+/// LSP characters are UTF-16 code units in the spec; we treat them as
+/// rope chars, which is exact for BMP-only source and off-by-one per
+/// non-BMP code point otherwise (see `edit_rename_symbol`'s doc).
+fn lsp_pos_to_char(buffer: &Buffer, line: u32, character: u32) -> Result<usize> {
+    let line = line as usize;
+    let character = character as usize;
+    if line >= buffer.line_count() {
+        return Err(anyhow!(
+            "lsp position line {} out of bounds (line_count = {})",
+            line,
+            buffer.line_count()
+        ));
+    }
+    let line_start = buffer.line_to_char(line);
+    let line_len = buffer.line_len_chars(line);
+    if character > line_len {
+        return Err(anyhow!(
+            "lsp position character {} past end of line {} (len = {})",
+            character,
+            line,
+            line_len
+        ));
+    }
+    Ok(line_start + character)
 }
 
 /// Try to spawn rust-analyzer for the buffer's file. Returns
@@ -530,6 +670,55 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[1].change_id, change_id);
         assert_eq!(history[1].intent, "multi-edit refactor");
+    }
+
+    #[test]
+    fn apply_text_edits_rewrites_multiple_ranges_end_to_start() {
+        use crate::lsp::{Position, Range, TextEdit};
+
+        let path = std::env::temp_dir()
+            .join(format!("dyad_apply_edits_{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut buf = Buffer::open(path).unwrap();
+        buf.insert_str(0, "fn old() { let old = 1; }\n");
+
+        // Two occurrences of `old`: at chars 3..6 and chars 15..18.
+        // LSP positions on line 0: characters 3..6 and 15..18.
+        // We pass them already sorted end-to-start the way
+        // edit_rename_symbol would.
+        let edits = vec![
+            TextEdit {
+                range: Range {
+                    start: Position { line: 0, character: 15 },
+                    end:   Position { line: 0, character: 18 },
+                },
+                new_text: "fresh".into(),
+            },
+            TextEdit {
+                range: Range {
+                    start: Position { line: 0, character: 3 },
+                    end:   Position { line: 0, character: 6 },
+                },
+                new_text: "fresh".into(),
+            },
+        ];
+        apply_text_edits(&mut buf, &edits).unwrap();
+        assert_eq!(buf.rope().to_string(), "fn fresh() { let fresh = 1; }\n");
+    }
+
+    #[test]
+    fn lsp_pos_to_char_maps_line_and_column() {
+        let path = std::env::temp_dir()
+            .join(format!("dyad_lsp_pos_{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut buf = Buffer::open(path).unwrap();
+        buf.insert_str(0, "ab\ncde\n");
+        // line 0, char 1 -> rope char 1 ('b')
+        assert_eq!(lsp_pos_to_char(&buf, 0, 1).unwrap(), 1);
+        // line 1, char 2 -> rope char 5 ('e')
+        assert_eq!(lsp_pos_to_char(&buf, 1, 2).unwrap(), 5);
+        // out of range line errors.
+        assert!(lsp_pos_to_char(&buf, 9, 0).is_err());
     }
 
     #[test]

@@ -201,6 +201,17 @@ fn tools_list_result() -> Value {
                     "buffer_id": {"type": "integer"},
                 },
             })),
+            tool_def("edit.rename_symbol", "Rename the symbol at (line, character) to new_name. Applies in-buffer edits as one transaction; cross-file changes come back in skipped_files. Requires rust-analyzer.", json!({
+                "type": "object",
+                "required": ["buffer_id", "version", "line", "character", "new_name"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                    "version":   {"type": "integer"},
+                    "line":      {"type": "integer", "minimum": 0},
+                    "character": {"type": "integer", "minimum": 0},
+                    "new_name":  {"type": "string"},
+                },
+            })),
         ]
     })
 }
@@ -338,6 +349,24 @@ fn dispatch_tool(
             let a: Args = serde_json::from_value(args)?;
             Ok(json!(state.diag_current(a.buffer_id)?))
         }
+        "edit.rename_symbol" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+                version: u64,
+                line: u32,
+                character: u32,
+                new_name: String,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            Ok(json!(state.edit_rename_symbol(
+                a.buffer_id,
+                a.version,
+                a.line,
+                a.character,
+                a.new_name,
+            )?))
+        }
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
     }
 }
@@ -460,6 +489,7 @@ mod tests {
             "history.recent",
             "symbol.definition",
             "diag.current",
+            "edit.rename_symbol",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }

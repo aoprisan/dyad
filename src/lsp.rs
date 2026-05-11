@@ -61,6 +61,25 @@ pub struct Diagnostic {
     pub source: Option<String>,
 }
 
+/// One range-replacement inside a [`WorkspaceEdit`]. LSP positions are
+/// line + UTF-16 code units within the line.
+#[derive(Deserialize, Clone, Debug)]
+pub struct TextEdit {
+    pub range: Range,
+    #[serde(rename = "newText")]
+    pub new_text: String,
+}
+
+/// Server response to `textDocument/rename`. We only consume the
+/// `changes` map for now — `documentChanges` (the versioned variant)
+/// is not negotiated in our `initialize` capabilities, so rust-analyzer
+/// falls back to `changes`.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct WorkspaceEdit {
+    #[serde(default)]
+    pub changes: std::collections::HashMap<String, Vec<TextEdit>>,
+}
+
 struct LspState {
     pending: HashMap<i64, Sender<Value>>,
     diagnostics: HashMap<String, Vec<Diagnostic>>,
@@ -187,6 +206,32 @@ impl LspClient {
                 Ok(vec![loc])
             }
             _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Ask the server for the workspace edits required to rename the
+    /// symbol at the given position to `new_name`. Returns the raw
+    /// `WorkspaceEdit`; the caller applies the in-buffer subset and
+    /// reports any cross-file changes that need a separate buffer.
+    pub fn rename(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+        new_name: &str,
+    ) -> Result<WorkspaceEdit> {
+        let result = self.request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+                "newName": new_name,
+            }),
+            Duration::from_secs(15),
+        )?;
+        match result {
+            Value::Null => Ok(WorkspaceEdit::default()),
+            other => Ok(serde_json::from_value(other)?),
         }
     }
 
