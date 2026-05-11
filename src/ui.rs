@@ -527,7 +527,7 @@ fn lsp_badge_span(app: &App) -> Option<Span<'static>> {
 }
 
 const HINT_TEXT: &str =
-    " Ctrl-T tree · Ctrl-N new · Ctrl-R git · Ctrl-S save · Ctrl-Q quit ";
+    " Ctrl-T tree · Ctrl-K type · Ctrl-Y rename · Ctrl-R git · Ctrl-S save · Ctrl-Q quit ";
 
 const TREE_HINT_TEXT: &str =
     " ↑/↓ move · Enter open · Esc close · Ctrl-T toggle ";

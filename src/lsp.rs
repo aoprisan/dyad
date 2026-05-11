@@ -240,6 +240,32 @@ impl LspClient {
         }
     }
 
+    /// Run `textDocument/hover` at the given position. Returns the
+    /// extracted plain-text body (joined MarkedString / MarkupContent
+    /// payloads), or `None` if the server has nothing to say there.
+    pub fn hover(&self, uri: &str, line: u32, character: u32) -> Result<Option<String>> {
+        let result = self.request(
+            "textDocument/hover",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+            }),
+            Duration::from_secs(10),
+        )?;
+        if result.is_null() {
+            return Ok(None);
+        }
+        let Some(contents) = result.get("contents") else {
+            return Ok(None);
+        };
+        let text = stringify_hover_contents(contents);
+        Ok(if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        })
+    }
+
     /// Ask the server for the workspace edits required to rename the
     /// symbol at the given position to `new_name`. Returns the raw
     /// `WorkspaceEdit`; the caller applies the in-buffer subset and
@@ -474,6 +500,30 @@ fn read_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>> {
 /// `current_dir().join(path)` so the URI is still absolute. A relative
 /// `file://src/main.rs` URI looks valid but rust-analyzer parses the
 /// empty/relative root as `/`, which breaks workspace discovery.
+/// Walk an LSP hover `contents` payload (MarkedString /
+/// MarkedString[] / MarkupContent) and return a flat string. The LSP
+/// spec is permissive here; we accept anything with a `value` field,
+/// fall back to plain strings, and join arrays with blank lines.
+fn stringify_hover_contents(c: &Value) -> String {
+    if let Some(s) = c.as_str() {
+        return s.to_string();
+    }
+    if let Some(obj) = c.as_object()
+        && let Some(v) = obj.get("value").and_then(|v| v.as_str())
+    {
+        return v.to_string();
+    }
+    if let Some(arr) = c.as_array() {
+        return arr
+            .iter()
+            .map(stringify_hover_contents)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+    }
+    String::new()
+}
+
 pub fn path_to_uri(path: &Path) -> String {
     let abs = absolutize(path);
     format!("file://{}", abs.display())

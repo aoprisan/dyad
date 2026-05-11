@@ -12,6 +12,7 @@ use crate::git::{self, LineStatus};
 use crate::input;
 use crate::lsp::{self, LspClient};
 use crate::syntax::Syntax;
+use crate::protocol;
 use crate::tree::{self, Activation, FileTree};
 use crate::tx::TxManager;
 use crate::ui;
@@ -85,6 +86,10 @@ pub enum PromptKind {
     /// Commit currently-staged changes in `repo_root` with the
     /// prompt buffer as the commit message.
     CommitMessage { repo_root: PathBuf },
+    /// LSP rename. The cursor position captured here pins the request
+    /// to the symbol the user actually wanted to rename, even if they
+    /// move the cursor while typing into the prompt.
+    RenameSymbol { line: u32, character: u32 },
 }
 
 pub struct HistoryView {
@@ -406,6 +411,12 @@ impl App {
             Action::GoBack => {
                 self.status = self.go_back();
             }
+            Action::ShowType => {
+                self.show_type();
+            }
+            Action::Rename => {
+                self.start_rename_prompt();
+            }
             // Handled in the modal-routing block above; listed here so the
             // compiler stays happy about exhaustiveness.
             Action::ToggleTree
@@ -414,6 +425,8 @@ impl App {
             | Action::NewFile
             | Action::ToggleAutosave
             | Action::Escape => {}
+            // Listed for exhaustiveness — `ShowType`/`Rename` are
+            // handled in their own arms above.
         }
 
         // Close out the auto-tx. If the mutation didn't actually change
@@ -601,7 +614,157 @@ impl App {
         match prompt.kind {
             PromptKind::NewFile { parent } => self.create_new_file(parent, prompt.buffer),
             PromptKind::CommitMessage { repo_root } => self.do_commit(repo_root, prompt.buffer),
+            PromptKind::RenameSymbol { line, character } => {
+                self.do_rename(line, character, prompt.buffer)
+            }
         }
+    }
+
+    /// Ctrl-K — ask the LSP for the type/signature at the cursor and
+    /// surface it in the status bar.
+    ///
+    /// rust-analyzer's hover payload starts with the enclosing
+    /// path/namespace as a code block ("crate::module::Item") and
+    /// puts the actual `let x: T` / `fn foo() -> U` in a *later*
+    /// block. `extract_signature` walks the fenced blocks and returns
+    /// the last non-empty one, which is the type the user is asking
+    /// about — picking the first block would surface the surrounding
+    /// scope instead.
+    ///
+    /// Field-definition special case: when the cursor sits on a
+    /// struct field name (e.g. `pub history: Option<…>`), the hover
+    /// payload is just the parent struct's path with no field info.
+    /// `looks_like_path_only` detects that shape and falls back to
+    /// extracting `: Type` from the source line so the user gets
+    /// `Option<…>` instead of `dyad::app::App`.
+    fn show_type(&mut self) {
+        let (Some(lsp), Some(uri)) = (self.lsp.as_ref(), self.lsp_uri.as_ref()) else {
+            self.status = "LSP not available".into();
+            return;
+        };
+        let line_idx = self.view.cursor_line();
+        let line = line_idx as u32;
+        let character = self.view.cursor_col() as u32;
+        match lsp.hover(uri, line, character) {
+            Ok(Some(text)) => match extract_signature(&text) {
+                Some(sig) => {
+                    let resolved = if looks_like_path_only(&sig) {
+                        type_from_source_line(&self.buffer, line_idx).unwrap_or(sig)
+                    } else {
+                        sig
+                    };
+                    self.status = format!("type: {resolved}");
+                }
+                None => self.status = "No type info".into(),
+            },
+            Ok(None) => {
+                self.status = if lsp.is_indexing() {
+                    "rust-analyzer still indexing — try again in a moment".into()
+                } else {
+                    "No type info".into()
+                };
+            }
+            Err(e) => self.status = format!("Hover failed: {e}"),
+        }
+    }
+
+    /// Ctrl-Y — open the rename prompt prefilled with the word under
+    /// the cursor. The cursor's `(line, character)` is captured into
+    /// the prompt so a stray Up/Down inside the prompt buffer doesn't
+    /// repoint the rename request.
+    fn start_rename_prompt(&mut self) {
+        if self.lsp.is_none() {
+            self.status = "LSP not available".into();
+            return;
+        }
+        let line = self.view.cursor_line() as u32;
+        let character = self.view.cursor_col() as u32;
+        let current = word_at_cursor(&self.buffer, &self.view);
+        self.prompt = Some(Prompt {
+            label: "Rename to:",
+            buffer: current,
+            kind: PromptKind::RenameSymbol { line, character },
+        });
+    }
+
+    fn do_rename(&mut self, line: u32, character: u32, new_name: String) -> Result<()> {
+        let trimmed = new_name.trim();
+        if trimmed.is_empty() {
+            self.status = "Empty name — rename aborted".into();
+            return Ok(());
+        }
+        let (Some(lsp), Some(uri)) = (self.lsp.as_ref(), self.lsp_uri.as_ref()) else {
+            self.status = "LSP not available".into();
+            return Ok(());
+        };
+        let workspace_edit = match lsp.rename(uri, line, character, trimmed) {
+            Ok(e) => e,
+            Err(e) => {
+                self.status = format!("Rename failed: {e}");
+                return Ok(());
+            }
+        };
+        let current_uri = self.lsp_uri.clone();
+        // Wrap the in-buffer edits in an auto-tx so the rename lands
+        // in the flat history with a human-readable intent (same idiom
+        // as the MCP protocol layer's `edit_rename_symbol`).
+        let intent = format!("rename -> {trimmed}");
+        let tx_id = self.tx_manager.begin(intent, None, &self.buffer);
+        let pre_version = self.tx_manager.pre_version(tx_id);
+
+        let mut applied = 0;
+        let mut other_files = 0;
+        for (edit_uri, edits) in &workspace_edit.changes {
+            if Some(edit_uri) == current_uri.as_ref() {
+                // Sort end-to-start so each successive edit's offsets
+                // are still correct under the previous one's mutation.
+                let mut sorted = edits.clone();
+                sorted.sort_by(|a, b| {
+                    (
+                        b.range.start.line,
+                        b.range.start.character,
+                        b.range.end.line,
+                        b.range.end.character,
+                    )
+                        .cmp(&(
+                            a.range.start.line,
+                            a.range.start.character,
+                            a.range.end.line,
+                            a.range.end.character,
+                        ))
+                });
+                if let Err(e) = protocol::apply_text_edits(&mut self.buffer, &sorted) {
+                    self.tx_manager.discard(tx_id)?;
+                    self.status = format!("Rename apply failed: {e}");
+                    return Ok(());
+                }
+                applied += sorted.len();
+            } else {
+                other_files += 1;
+            }
+        }
+
+        if Some(self.buffer.version()) == pre_version {
+            self.tx_manager.discard(tx_id)?;
+        } else {
+            self.tx_manager.commit(tx_id, &self.buffer)?;
+            self.notify_lsp_changed();
+            self.last_edit = Some(Instant::now());
+            if let Some(syn) = self.syntax.as_mut() {
+                syn.refresh(&mut self.buffer);
+            }
+        }
+
+        self.status = if other_files > 0 {
+            format!(
+                "Renamed {applied} occurrence(s); {other_files} other file(s) need manual edit"
+            )
+        } else if applied == 0 {
+            "Nothing to rename".into()
+        } else {
+            format!("Renamed {applied} occurrence(s)")
+        };
+        Ok(())
     }
 
     fn create_new_file(&mut self, parent: PathBuf, name: String) -> Result<()> {
@@ -1084,6 +1247,126 @@ fn classify(staged: char, unstaged: char) -> GitGroup {
     }
 }
 
+/// Return the word at the view's cursor — the maximal run of
+/// alphanumerics + `_` straddling the cursor's char index. Returns
+/// an empty string if the cursor isn't touching a word.
+fn word_at_cursor(buffer: &Buffer, view: &View) -> String {
+    let idx = view.char_idx(buffer);
+    let total = buffer.len_chars();
+    let rope = buffer.rope();
+    let mut start = idx;
+    while start > 0 {
+        let c = rope.char(start - 1);
+        if !is_word_char(c) {
+            break;
+        }
+        start -= 1;
+    }
+    let mut end = idx;
+    while end < total {
+        let c = rope.char(end);
+        if !is_word_char(c) {
+            break;
+        }
+        end += 1;
+    }
+    if start == end {
+        return String::new();
+    }
+    rope.slice(start..end).chars().collect()
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// True when `s` looks like a bare `crate::module::Item` path — used
+/// to detect rust-analyzer's "I only know the enclosing scope" hover
+/// reply for struct-field definitions. Any whitespace or type-syntax
+/// punctuation (`<`, `(`, `{`) means we already have something real.
+fn looks_like_path_only(s: &str) -> bool {
+    s.contains("::")
+        && !s.contains(' ')
+        && !s.contains('<')
+        && !s.contains('(')
+        && !s.contains('{')
+}
+
+/// Pull a Rust-style `: Type` annotation out of the source `line`,
+/// stopping at the first `,`, `=`, or `{` that terminates the type.
+/// Returns `None` when the line has no colon at all (typical for
+/// expression lines that don't declare anything).
+fn type_from_source_line(buffer: &Buffer, line: usize) -> Option<String> {
+    if line >= buffer.line_count() {
+        return None;
+    }
+    let mut text: String = buffer.line(line).chars().collect();
+    if text.ends_with('\n') {
+        text.pop();
+    }
+    if text.ends_with('\r') {
+        text.pop();
+    }
+    let colon = text.find(':')?;
+    // `::` is a path separator, not a type annotation. Skip past
+    // runs of consecutive colons (the first `:` in `Vec::new`)
+    // before we start carving up the right side.
+    let after_colon = text[colon..]
+        .find(|c: char| c != ':')
+        .map(|off| colon + off)?;
+    let after = text[after_colon..].trim_start();
+    let end = after.find([',', '=', '{']).unwrap_or(after.len());
+    let ty = after[..end].trim_end();
+    if ty.is_empty() {
+        None
+    } else {
+        Some(ty.to_string())
+    }
+}
+
+/// Collapse a rust-analyzer hover markdown payload to the signature
+/// line we want in the status bar. The hover layout puts namespace /
+/// owning-impl info in the first code block and the actual type or
+/// fn signature in a later block; we return the last non-empty
+/// fenced block (joined to a single line). If the payload has no
+/// fenced blocks at all — some hovers are plain text — we fall back
+/// to the first non-empty line.
+fn extract_signature(text: &str) -> Option<String> {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            if let Some(buf) = current.take() {
+                blocks.push(buf);
+            } else {
+                current = Some(String::new());
+            }
+            continue;
+        }
+        if let Some(buf) = current.as_mut() {
+            if !buf.is_empty() {
+                buf.push(' ');
+            }
+            buf.push_str(line.trim());
+        }
+    }
+    if let Some(buf) = current.take() {
+        blocks.push(buf);
+    }
+    if let Some(last) = blocks
+        .into_iter()
+        .rev()
+        .map(|b| b.trim().to_string())
+        .find(|b| !b.is_empty())
+    {
+        return Some(last);
+    }
+    text.lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// Mirror of `load_diff_for_cursor` for the history view.
 fn load_commit_for_cursor(view: &mut HistoryView) {
     let Some(entry) = view.entries.get(view.cursor) else {
@@ -1169,6 +1452,8 @@ fn action_intent(action: &Action) -> Option<String> {
         | Action::ToggleHistory
         | Action::NewFile
         | Action::ToggleAutosave
+        | Action::ShowType
+        | Action::Rename
         | Action::Escape => None,
     }
 }
@@ -1189,5 +1474,93 @@ fn describe_char(c: char) -> String {
         ' ' => "space".into(),
         c if c.is_ascii_graphic() => format!("'{c}'"),
         c => format!("U+{:04X}", c as u32),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_signature_picks_last_code_block() {
+        // rust-analyzer hover payload: first block is the path,
+        // second block is the actual signature.
+        let hover = "\
+```rust
+test_crate::main
+```
+
+```rust
+let x: i32
+```
+";
+        assert_eq!(extract_signature(hover).as_deref(), Some("let x: i32"));
+    }
+
+    #[test]
+    fn extract_signature_handles_multi_line_blocks() {
+        let hover = "\
+```rust
+fn foo(
+    a: i32,
+) -> i32
+```
+";
+        assert_eq!(
+            extract_signature(hover).as_deref(),
+            Some("fn foo( a: i32, ) -> i32")
+        );
+    }
+
+    #[test]
+    fn extract_signature_falls_back_to_plain_text() {
+        assert_eq!(
+            extract_signature("just a plain line").as_deref(),
+            Some("just a plain line")
+        );
+    }
+
+    #[test]
+    fn looks_like_path_only_flags_bare_paths() {
+        assert!(looks_like_path_only("dyad::app::App"));
+        assert!(looks_like_path_only("core::option::Option"));
+        // Real signatures with structure should not match.
+        assert!(!looks_like_path_only("Option<HistoryView>"));
+        assert!(!looks_like_path_only("fn foo() -> i32"));
+        assert!(!looks_like_path_only("let x: i32"));
+        // Plain types without `::` shouldn't trigger the fallback —
+        // they're already useful.
+        assert!(!looks_like_path_only("i32"));
+        assert!(!looks_like_path_only("App"));
+    }
+
+    #[test]
+    fn type_from_source_line_extracts_field_type() {
+        let buffer = buffer_with("    pub history: Option<HistoryView>,\n");
+        assert_eq!(
+            type_from_source_line(&buffer, 0).as_deref(),
+            Some("Option<HistoryView>")
+        );
+    }
+
+    #[test]
+    fn type_from_source_line_extracts_let_binding() {
+        let buffer = buffer_with("let x: i32 = 5;\n");
+        assert_eq!(
+            type_from_source_line(&buffer, 0).as_deref(),
+            Some("i32")
+        );
+    }
+
+    #[test]
+    fn type_from_source_line_returns_none_for_expression_only() {
+        let buffer = buffer_with("foo(bar);\n");
+        assert_eq!(type_from_source_line(&buffer, 0), None);
+    }
+
+    fn buffer_with(text: &str) -> Buffer {
+        let mut b = Buffer::scratch();
+        b.insert_str(0, text);
+        b
     }
 }

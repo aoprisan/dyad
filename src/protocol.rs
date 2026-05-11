@@ -758,7 +758,7 @@ impl ProtocolState {
 
 /// Apply a list of LSP `TextEdit`s to a buffer. Caller is responsible
 /// for sorting the edits end-to-start so earlier indices stay valid.
-fn apply_text_edits(buffer: &mut Buffer, edits: &[TextEdit]) -> Result<()> {
+pub(crate) fn apply_text_edits(buffer: &mut Buffer, edits: &[TextEdit]) -> Result<()> {
     for edit in edits {
         let start = lsp_pos_to_char(buffer, edit.range.start.line, edit.range.start.character)?;
         let end = lsp_pos_to_char(buffer, edit.range.end.line, edit.range.end.character)?;
@@ -776,7 +776,7 @@ fn apply_text_edits(buffer: &mut Buffer, edits: &[TextEdit]) -> Result<()> {
 /// LSP characters are UTF-16 code units in the spec; we treat them as
 /// rope chars, which is exact for BMP-only source and off-by-one per
 /// non-BMP code point otherwise.
-fn lsp_pos_to_char(buffer: &Buffer, line: u32, character: u32) -> Result<usize> {
+pub(crate) fn lsp_pos_to_char(buffer: &Buffer, line: u32, character: u32) -> Result<usize> {
     let line = line as usize;
     let character = character as usize;
     if line >= buffer.line_count() {

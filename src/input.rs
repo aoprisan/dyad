@@ -73,6 +73,14 @@ pub fn map(ev: KeyEvent) -> Option<Action> {
                     'w' => Some(Action::ToggleAutosave),
                     // Ctrl-L ("log"): toggle the commit-history view.
                     'l' => Some(Action::ToggleHistory),
+                    // Ctrl-K ("kind"): LSP hover — show the type /
+                    // signature of the symbol under the cursor.
+                    'k' => Some(Action::ShowType),
+                    // Ctrl-Y: LSP rename — prompt for the new name
+                    // and apply the workspace edits to the current
+                    // buffer (cross-file edits are skipped with a
+                    // count in the status bar).
+                    'y' => Some(Action::Rename),
                     _ => None,
                 }
             } else if alt {

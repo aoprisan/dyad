@@ -17,6 +17,8 @@ pub enum Action {
     Quit,
     GoToDefinition,
     GoBack,
+    ShowType,
+    Rename,
     ToggleTree,
     ToggleGitDiff,
     ToggleHistory,
