@@ -215,3 +215,208 @@ impl View {
         self.sticky_col = self.cursor_col;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buffer_with(text: &str) -> Buffer {
+        let mut b = Buffer::scratch();
+        b.insert_str(0, text);
+        b
+    }
+
+    #[test]
+    fn new_view_starts_at_origin() {
+        let v = View::new();
+        assert_eq!(v.cursor_line(), 0);
+        assert_eq!(v.cursor_col(), 0);
+        assert_eq!(v.top_line(), 0);
+    }
+
+    #[test]
+    fn move_right_steps_one_char_then_wraps_to_next_line() {
+        let buf = buffer_with("ab\ncd\n");
+        let mut v = View::new();
+        v.move_right(&buf);
+        assert_eq!((v.cursor_line(), v.cursor_col()), (0, 1));
+        v.move_right(&buf);
+        assert_eq!((v.cursor_line(), v.cursor_col()), (0, 2));
+        // At end-of-line, next press jumps to start of next line.
+        v.move_right(&buf);
+        assert_eq!((v.cursor_line(), v.cursor_col()), (1, 0));
+    }
+
+    #[test]
+    fn move_left_wraps_to_previous_line_end() {
+        let buf = buffer_with("ab\ncd\n");
+        let mut v = View::new();
+        v.goto(&buf, 1, 0);
+        v.move_left(&buf);
+        // Lands at end of line 0 ("ab" = col 2).
+        assert_eq!((v.cursor_line(), v.cursor_col()), (0, 2));
+        // At buffer start, move_left is a no-op.
+        v.goto(&buf, 0, 0);
+        v.move_left(&buf);
+        assert_eq!((v.cursor_line(), v.cursor_col()), (0, 0));
+    }
+
+    #[test]
+    fn move_up_down_preserves_sticky_column() {
+        let buf = buffer_with("longer line\nshort\nlonger again\n");
+        let mut v = View::new();
+        // Cursor on line 0, col 8.
+        v.goto(&buf, 0, 8);
+        v.move_down(&buf);
+        // line 1 ("short") has only 5 chars; cursor clamps to 5.
+        assert_eq!((v.cursor_line(), v.cursor_col()), (1, 5));
+        v.move_down(&buf);
+        // Sticky col 8 restored on the longer line.
+        assert_eq!((v.cursor_line(), v.cursor_col()), (2, 8));
+    }
+
+    #[test]
+    fn move_up_at_top_resets_column_to_zero() {
+        let buf = buffer_with("abcd\nef\n");
+        let mut v = View::new();
+        v.goto(&buf, 0, 3);
+        v.move_up(&buf);
+        // Implementation: when on the first line, move_up homes the cursor.
+        assert_eq!((v.cursor_line(), v.cursor_col()), (0, 0));
+    }
+
+    #[test]
+    fn move_down_at_bottom_goes_to_end_of_last_line() {
+        let buf = buffer_with("abc\nde");
+        let mut v = View::new();
+        v.goto(&buf, 1, 0);
+        v.move_down(&buf);
+        // Last line "de" -> cursor at col 2.
+        assert_eq!((v.cursor_line(), v.cursor_col()), (1, 2));
+    }
+
+    #[test]
+    fn move_home_and_end() {
+        let buf = buffer_with("abcdef\n");
+        let mut v = View::new();
+        v.goto(&buf, 0, 3);
+        v.move_home();
+        assert_eq!(v.cursor_col(), 0);
+        v.move_end(&buf);
+        assert_eq!(v.cursor_col(), 6);
+    }
+
+    #[test]
+    fn move_word_right_skips_word_then_whitespace() {
+        let buf = buffer_with("hello world\n");
+        let mut v = View::new();
+        v.move_word_right(&buf);
+        // Skips "hello" (5 chars) and the space → col 6.
+        assert_eq!((v.cursor_line(), v.cursor_col()), (0, 6));
+    }
+
+    #[test]
+    fn move_word_right_groups_punctuation_runs() {
+        let buf = buffer_with("foo}}}bar\n");
+        let mut v = View::new();
+        v.goto(&buf, 0, 3);
+        v.move_word_right(&buf);
+        // The "}}}" run is treated as one hop, landing at "bar" (col 6).
+        assert_eq!((v.cursor_line(), v.cursor_col()), (0, 6));
+    }
+
+    #[test]
+    fn move_word_left_steps_back_one_word() {
+        let buf = buffer_with("alpha beta gamma");
+        let mut v = View::new();
+        v.goto(&buf, 0, 16); // end of "gamma"
+        v.move_word_left(&buf);
+        // Land at start of "gamma".
+        assert_eq!((v.cursor_line(), v.cursor_col()), (0, 11));
+        v.move_word_left(&buf);
+        assert_eq!((v.cursor_line(), v.cursor_col()), (0, 6));
+    }
+
+    #[test]
+    fn move_word_left_at_start_is_noop() {
+        let buf = buffer_with("hello");
+        let mut v = View::new();
+        v.move_word_left(&buf);
+        assert_eq!(v.char_idx(&buf), 0);
+    }
+
+    #[test]
+    fn page_up_and_page_down_clamp_to_buffer() {
+        let buf = buffer_with("a\nb\nc\nd\ne\nf\ng\n");
+        let mut v = View::new();
+        v.page_down(&buf, 3);
+        assert_eq!(v.cursor_line(), 3);
+        assert_eq!(v.top_line(), 3);
+        v.page_down(&buf, 100);
+        // Clamped to last line.
+        assert_eq!(v.cursor_line(), buf.line_count() - 1);
+        v.page_up(&buf, 100);
+        // Saturating subtract.
+        assert_eq!(v.top_line(), 0);
+        assert_eq!(v.cursor_line(), 0);
+    }
+
+    #[test]
+    fn scroll_into_view_brings_cursor_into_viewport() {
+        let buf = buffer_with("0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n");
+        let mut v = View::new();
+        v.goto(&buf, 5, 0);
+        v.scroll_into_view(3);
+        // After scroll: top_line = cursor_line + 1 - viewport = 3.
+        assert_eq!(v.top_line(), 3);
+        // Scrolling further up moves top_line down.
+        v.goto(&buf, 1, 0);
+        v.scroll_into_view(3);
+        assert_eq!(v.top_line(), 1);
+    }
+
+    #[test]
+    fn after_insert_advances_for_each_char() {
+        let buf = buffer_with("hi");
+        let mut v = View::new();
+        v.after_insert(&buf, "hi");
+        assert_eq!(v.cursor_col(), 2);
+        // After inserting a newline, cursor drops to next line.
+        let buf2 = buffer_with("hi\n");
+        v.after_insert(&buf2, "\n");
+        assert_eq!(v.cursor_line(), 1);
+        assert_eq!(v.cursor_col(), 0);
+    }
+
+    #[test]
+    fn after_delete_prev_walks_back_across_lines() {
+        let buf = buffer_with("ab\ncd\n");
+        let mut v = View::new();
+        v.goto(&buf, 1, 0);
+        v.after_delete_prev(&buf);
+        // Wraps to end of previous line.
+        assert_eq!((v.cursor_line(), v.cursor_col()), (0, 2));
+    }
+
+    #[test]
+    fn goto_clamps_line_and_column() {
+        let buf = buffer_with("ab\nc\n");
+        let mut v = View::new();
+        // Past end of column.
+        v.goto(&buf, 1, 99);
+        assert_eq!((v.cursor_line(), v.cursor_col()), (1, 1));
+        // Past end of buffer.
+        v.goto(&buf, 99, 0);
+        let last = buf.line_count() - 1;
+        assert_eq!(v.cursor_line(), last);
+    }
+
+    #[test]
+    fn char_idx_matches_line_to_char_plus_col() {
+        let buf = buffer_with("ab\ncde\nfg\n");
+        let mut v = View::new();
+        v.goto(&buf, 1, 2);
+        // line_to_char(1) = 3, col 2 => char_idx = 5.
+        assert_eq!(v.char_idx(&buf), 5);
+    }
+}

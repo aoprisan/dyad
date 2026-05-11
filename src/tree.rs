@@ -274,3 +274,206 @@ fn absolutize(path: &Path) -> PathBuf {
         Err(_) => PathBuf::from(path),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a unique temp dir with the given subtree structure.
+    fn make_tree(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "dyad_tree_test_{}_{}_{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        std::fs::write(root.join("b.txt"), "b").unwrap();
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested").join("c.txt"), "c").unwrap();
+        // Hidden file should not show up.
+        std::fs::write(root.join(".hidden"), "h").unwrap();
+        root
+    }
+
+    fn cleanup(p: &Path) {
+        let _ = std::fs::remove_dir_all(p);
+    }
+
+    #[test]
+    fn new_lists_top_level_entries_with_parent_link() {
+        let root = make_tree("new");
+        let tree = FileTree::new(root.clone());
+        // Sorted by directory-first then name, prefixed by the synthetic ".." row.
+        assert!(tree.entries.first().unwrap().is_parent_link);
+        let visible: Vec<&str> = tree
+            .entries
+            .iter()
+            .filter(|e| !e.is_parent_link)
+            .map(|e| e.name.as_str())
+            .collect();
+        // Hidden file omitted; "nested" before files since dirs go first.
+        assert_eq!(visible, vec!["nested", "a.txt", "b.txt"]);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn move_up_and_down_clamp_at_boundaries() {
+        let root = make_tree("nav");
+        let mut tree = FileTree::new(root.clone());
+        let last = tree.entries.len() - 1;
+
+        tree.move_up(); // already at 0, no-op
+        assert_eq!(tree.cursor, 0);
+
+        for _ in 0..tree.entries.len() + 5 {
+            tree.move_down();
+        }
+        assert_eq!(tree.cursor, last);
+
+        for _ in 0..tree.entries.len() + 5 {
+            tree.move_up();
+        }
+        assert_eq!(tree.cursor, 0);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn activate_on_file_yields_open() {
+        let root = make_tree("activate_file");
+        let mut tree = FileTree::new(root.clone());
+        // Move to "a.txt" — find its index.
+        let idx = tree
+            .entries
+            .iter()
+            .position(|e| !e.is_parent_link && e.name == "a.txt")
+            .unwrap();
+        tree.cursor = idx;
+        match tree.activate() {
+            Activation::Open(path) => {
+                assert_eq!(path.file_name().unwrap(), "a.txt");
+            }
+            _ => panic!("expected Activation::Open"),
+        }
+        cleanup(&root);
+    }
+
+    #[test]
+    fn activate_on_directory_toggles_expansion() {
+        let root = make_tree("activate_dir");
+        let mut tree = FileTree::new(root.clone());
+        let idx = tree
+            .entries
+            .iter()
+            .position(|e| !e.is_parent_link && e.is_dir && e.name == "nested")
+            .unwrap();
+        tree.cursor = idx;
+        let before = tree.entries.len();
+        // First activate expands.
+        match tree.activate() {
+            Activation::None => {}
+            _ => panic!("expected Activation::None when toggling expand"),
+        }
+        assert!(tree.entries[idx].expanded);
+        assert!(tree.entries.len() > before);
+        // Second activate collapses again.
+        tree.activate();
+        assert!(!tree.entries[idx].expanded);
+        assert_eq!(tree.entries.len(), before);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn activate_on_parent_link_returns_ascend() {
+        let root = make_tree("ascend");
+        let mut tree = FileTree::new(root.clone());
+        tree.cursor = 0; // synthetic ".."
+        match tree.activate() {
+            Activation::Ascend => {}
+            _ => panic!("expected Activation::Ascend"),
+        }
+        cleanup(&root);
+    }
+
+    #[test]
+    fn reveal_returns_false_for_path_outside_root() {
+        let root = make_tree("outside");
+        let other = std::env::temp_dir().join("dyad_tree_outside_other.txt");
+        let _ = std::fs::write(&other, "x");
+        let mut tree = FileTree::new(root.clone());
+        assert!(!tree.reveal(&other));
+        let _ = std::fs::remove_file(&other);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn reveal_expands_path_and_positions_cursor() {
+        let root = make_tree("reveal");
+        let mut tree = FileTree::new(root.clone());
+        let nested_file = root.join("nested").join("c.txt");
+        assert!(tree.reveal(&nested_file));
+        // Cursor should be on the c.txt entry.
+        let entry = &tree.entries[tree.cursor];
+        assert_eq!(entry.name, "c.txt");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn scroll_into_view_brings_cursor_into_viewport() {
+        let root = make_tree("scroll");
+        let mut tree = FileTree::new(root.clone());
+        tree.cursor = tree.entries.len() - 1;
+        tree.scroll_into_view(2);
+        assert!(tree.top >= tree.cursor + 1 - 2);
+        // Reset to 0; scroll_into_view should walk top back down to 0.
+        tree.cursor = 0;
+        tree.scroll_into_view(2);
+        assert_eq!(tree.top, 0);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn scroll_into_view_zero_viewport_is_noop() {
+        let root = make_tree("noop_scroll");
+        let mut tree = FileTree::new(root.clone());
+        let original_top = tree.top;
+        tree.cursor = 99;
+        tree.scroll_into_view(0);
+        assert_eq!(tree.top, original_top);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn ascend_resets_to_parent_directory() {
+        let root = make_tree("ascend_root");
+        let mut tree = FileTree::new(root.clone());
+        let parent_dir = tree.root.parent().unwrap().to_path_buf();
+        tree.ascend();
+        assert_eq!(tree.root, parent_dir);
+        // After ascending, the new root list is re-derived (cursor at 0).
+        assert_eq!(tree.cursor, 0);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn project_root_for_finds_git_dir() {
+        let parent = std::env::temp_dir().join(format!(
+            "dyad_tree_proj_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(parent.join(".git")).unwrap();
+        std::fs::create_dir_all(parent.join("src")).unwrap();
+        let canonical_parent = parent.canonicalize().unwrap();
+        let resolved = project_root_for(&parent.join("src"));
+        assert_eq!(resolved, canonical_parent);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+}
