@@ -73,6 +73,7 @@ assert_contains 2 '"name":"edit.rename_symbol"'
 assert_contains 2 '"name":"buffer.open"'
 assert_contains 2 '"name":"buffer.close"'
 assert_contains 2 '"name":"clients.list"'
+assert_contains 2 '"name":"git.diff"'
 assert_contains 3 'fn hello() {}'
 # id=4's payload is a JSON-stringified array inside an MCP text content
 # item, so quotes are backslash-escaped on the wire — match that form.

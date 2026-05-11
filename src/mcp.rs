@@ -117,6 +117,13 @@ fn tools_list_result() -> Value {
                 "type": "object",
                 "properties": {},
             })),
+            tool_def("git.diff", "Return the raw `git diff HEAD --no-color -- <path>` for the buffer's file. Errors when the file isn't tracked or git isn't usable.", json!({
+                "type": "object",
+                "required": ["buffer_id"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                },
+            })),
             tool_def("buffer.read", "Read all or part of a buffer's text. Returns {text, version}.", json!({
                 "type": "object",
                 "required": ["buffer_id"],
@@ -291,6 +298,15 @@ fn dispatch_tool(
             Ok(json!({}))
         }
         "clients.list" => Ok(json!(state.clients_list())),
+        "git.diff" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            let diff = state.git_diff(a.buffer_id)?;
+            Ok(json!({ "diff": diff }))
+        }
         "buffer.read" => {
             #[derive(Deserialize)]
             struct Args {
@@ -532,6 +548,7 @@ mod tests {
             "buffer.open",
             "buffer.close",
             "clients.list",
+            "git.diff",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }

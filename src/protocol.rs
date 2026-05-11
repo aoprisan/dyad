@@ -20,6 +20,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::buffer::Buffer;
+use crate::git;
 use crate::lsp::{self, Diagnostic, Location, LspClient, TextEdit};
 use crate::syntax::{AstMatch, Syntax};
 use crate::tx::{Change, ChangeId, TxId, TxManager};
@@ -501,6 +502,22 @@ impl ProtocolState {
             applied,
             skipped_files,
         })
+    }
+
+    // ---------- Git (Phase 9) ----------
+
+    /// Raw `git diff HEAD --no-color -- <path>` for the buffer's file.
+    /// Returns `Err` when the file isn't tracked or git isn't usable.
+    pub fn git_diff(&self, buffer_id: u64) -> Result<String> {
+        let entry = self
+            .buffers
+            .get(&buffer_id)
+            .ok_or_else(|| anyhow!("unknown buffer_id {}", buffer_id))?;
+        let path = entry
+            .buffer
+            .path()
+            .context("buffer has no path; cannot diff against HEAD")?;
+        git::diff_text(path)
     }
 
     // ---------- Read-only accessors (for tests + transport) ----------

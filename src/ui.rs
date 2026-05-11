@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::App;
+use crate::git::LineStatus;
 use crate::syntax::{self, HighlightSpan};
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -35,14 +36,16 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 fn gutter_width(line_count: usize) -> u16 {
     let digits = line_count.max(1).to_string().len() as u16;
-    digits + 1 // one space between the number and the text column
+    // <digits><space><1-char git status><space before text>
+    digits + 2
 }
 
 fn render_gutter(frame: &mut Frame, rect: Rect, app: &App, gutter_width: u16) {
     let rows = rect.height as usize;
     let total_lines = app.buffer.line_count();
     let mut lines = Vec::with_capacity(rows);
-    let number_width = (gutter_width as usize).saturating_sub(1);
+    // Reserve the last column for the git status marker.
+    let number_width = (gutter_width as usize).saturating_sub(2);
     let dim = Style::default().fg(Color::DarkGray);
     for r in 0..rows {
         let line_idx = app.view.top_line() + r;
@@ -50,10 +53,23 @@ fn render_gutter(frame: &mut Frame, rect: Rect, app: &App, gutter_width: u16) {
             lines.push(Line::raw(""));
             continue;
         }
-        let text = format!("{:>width$} ", line_idx + 1, width = number_width);
-        lines.push(Line::from(Span::styled(text, dim)));
+        let number = Span::styled(
+            format!("{:>width$}", line_idx + 1, width = number_width),
+            dim,
+        );
+        let marker = git_marker_span(app, line_idx);
+        lines.push(Line::from(vec![number, Span::raw(" "), marker]));
     }
     frame.render_widget(Paragraph::new(lines), rect);
+}
+
+fn git_marker_span(app: &App, line_idx: usize) -> Span<'static> {
+    match app.git_status.get(&line_idx) {
+        Some(LineStatus::Added) => Span::styled("+", Style::default().fg(Color::Green)),
+        Some(LineStatus::Modified) => Span::styled("~", Style::default().fg(Color::Yellow)),
+        Some(LineStatus::DeletedAbove) => Span::styled("\u{203E}", Style::default().fg(Color::Red)),
+        None => Span::raw(" "),
+    }
 }
 
 fn render_text(frame: &mut Frame, rect: Rect, app: &App) {

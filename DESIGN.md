@@ -212,6 +212,12 @@ Known scope limits in this iteration:
   TUI + MCP client list (with cursor focus) needs a daemon split of
   the editor; `clients.cursor` and `clients.subscribe_edits` need
   streaming notifications and aren't wired yet.
+- The TUI gutter shows per-line git status against `HEAD` (`+` added,
+  `~` modified, overline for deletion-above), refreshed after save.
+  The MCP `git.diff` tool exposes the same data as a raw unified
+  patch. Both shell out to `git`; agents and humans see whatever the
+  on-disk file says — unsaved buffer changes don't yet feed into the
+  diff (would need a temp-file or in-process diff algorithm).
 - No `view.*`, `symbol.references`, `symbol.signature`,
   `edit.extract_function`, `edit.add_import`, `edit.inline`, or
   `note.pin` yet.

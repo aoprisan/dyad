@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -7,6 +8,7 @@ use ratatui::DefaultTerminal;
 
 use crate::action::Action;
 use crate::buffer::Buffer;
+use crate::git::{self, LineStatus};
 use crate::input;
 use crate::syntax::Syntax;
 use crate::tx::TxManager;
@@ -19,6 +21,10 @@ pub struct App {
     pub syntax: Option<Syntax>,
     pub running: bool,
     pub status: String,
+    /// Per-line git status against HEAD, keyed by 0-indexed line in the
+    /// working-tree file. Refreshed on save and at startup; empty when
+    /// the file isn't in a git repo (or git isn't installed).
+    pub git_status: HashMap<usize, LineStatus>,
     tx_manager: TxManager,
     quit_pending: bool,
 }
@@ -30,12 +36,14 @@ impl App {
         if let Some(syn) = syntax.as_mut() {
             syn.refresh(&mut buffer);
         }
+        let git_status = compute_git_status(buffer.path());
         Ok(Self {
             buffer,
             view: View::new(),
             syntax,
             running: true,
             status: String::new(),
+            git_status,
             tx_manager: TxManager::new(),
             quit_pending: false,
         })
@@ -122,7 +130,10 @@ impl App {
                 }
             }
             Action::Save => match self.buffer.save() {
-                Ok(bytes) => self.status = format!("Saved {} bytes", bytes),
+                Ok(bytes) => {
+                    self.status = format!("Saved {} bytes", bytes);
+                    self.git_status = compute_git_status(self.buffer.path());
+                }
                 Err(e) => self.status = format!("Save failed: {}", e),
             },
             Action::Quit => {
@@ -178,6 +189,15 @@ fn action_intent(action: &Action) -> Option<String> {
         | Action::Save
         | Action::Quit => None,
     }
+}
+
+fn compute_git_status(path: Option<&std::path::Path>) -> HashMap<usize, LineStatus> {
+    let Some(path) = path else {
+        return HashMap::new();
+    };
+    git::diff_against_head(path)
+        .map(|changes| changes.into_iter().map(|c| (c.line, c.status)).collect())
+        .unwrap_or_default()
 }
 
 fn describe_char(c: char) -> String {
