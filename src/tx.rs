@@ -10,16 +10,19 @@
 //! Phase 4 (MCP) will pass real intent strings from agent calls.
 
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
+use serde::{Deserialize, Serialize};
 
 use crate::buffer::{Buffer, BufferSnapshot};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct TxId(u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ChangeId(u64);
 
 struct ActiveTx {
@@ -32,14 +35,29 @@ struct ActiveTx {
 }
 
 #[allow(dead_code)] // Phase 4: fields are consumed by the MCP `history.recent` handler.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Change {
     pub change_id: ChangeId,
     pub tx_id: TxId,
     pub intent: String,
     pub conversation_id: Option<String>,
+    /// Unix seconds; `serde` doesn't ship a SystemTime impl by default,
+    /// and an unsigned-seconds wire format is what the agent wants anyway.
+    #[serde(rename = "timestamp_unix")]
+    #[serde(serialize_with = "serialize_systemtime_unix")]
     pub timestamp: SystemTime,
     pub files: Vec<PathBuf>,
+}
+
+fn serialize_systemtime_unix<S>(t: &SystemTime, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    s.serialize_u64(secs)
 }
 
 pub struct TxManager {

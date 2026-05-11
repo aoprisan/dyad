@@ -15,6 +15,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use ratatui::style::{Color, Modifier, Style};
 use ropey::Rope;
+use serde::Serialize;
 use tree_sitter::{InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree};
 
 use crate::buffer::{Buffer, Edit};
@@ -61,7 +62,7 @@ pub struct HighlightSpan {
 /// rope's current contents — pair it with `Buffer::version()` if you plan
 /// to act on it (optimistic-concurrency, DESIGN.md §Buffers & views).
 #[allow(dead_code)] // Phase 4: fields are consumed by the MCP `ast.query` handler.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct AstMatch {
     pub capture: String,
     pub kind: String,
@@ -205,6 +206,16 @@ impl Syntax {
             .get(line)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// Drop the cached parse tree and force the next `refresh` to do a
+    /// full reparse from scratch. Call after `Buffer::restore` (Phase 3
+    /// rollback) — otherwise the incremental-reparse path would feed
+    /// tree-sitter an old tree that doesn't match the restored rope.
+    #[allow(dead_code)] // Phase 4: invoked from ProtocolState::tx_rollback.
+    pub fn invalidate(&mut self) {
+        self.tree = None;
+        self.cached_version = None;
     }
 
     /// Run a tree-sitter query against the cached parse tree. Returns one
