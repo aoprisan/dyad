@@ -6,11 +6,31 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use ropey::{Rope, RopeSlice};
 
+/// A summary of a single mutation, in tree-sitter-compatible coordinates
+/// (byte offsets + zero-based row/column points). `Syntax::refresh` feeds
+/// these into `Tree::edit` so the next reparse can be incremental.
+///
+/// Kept tree-sitter-agnostic on purpose — Buffer doesn't depend on
+/// tree-sitter; the syntax layer translates `Edit` into `InputEdit`.
+#[derive(Clone, Copy, Debug)]
+pub struct Edit {
+    pub start_byte: usize,
+    pub old_end_byte: usize,
+    pub new_end_byte: usize,
+    pub start_row: usize,
+    pub start_col: usize,
+    pub old_end_row: usize,
+    pub old_end_col: usize,
+    pub new_end_row: usize,
+    pub new_end_col: usize,
+}
+
 pub struct Buffer {
     rope: Rope,
     path: Option<PathBuf>,
     version: u64,
     dirty: bool,
+    pending_edits: Vec<Edit>,
 }
 
 impl Buffer {
@@ -28,26 +48,68 @@ impl Buffer {
             path: Some(path),
             version: 0,
             dirty: false,
+            pending_edits: Vec::new(),
         })
     }
 
     pub fn insert_char(&mut self, char_idx: usize, c: char) {
+        let (start_byte, row, col) = self.byte_row_col_at_char(char_idx);
+        let c_len = c.len_utf8();
+        let (new_end_row, new_end_col) = if c == '\n' {
+            (row + 1, 0)
+        } else {
+            (row, col + c_len)
+        };
         self.rope.insert_char(char_idx, c);
-        self.touch();
+        self.push_edit(Edit {
+            start_byte,
+            old_end_byte: start_byte,
+            new_end_byte: start_byte + c_len,
+            start_row: row,
+            start_col: col,
+            old_end_row: row,
+            old_end_col: col,
+            new_end_row,
+            new_end_col,
+        });
     }
 
     #[allow(dead_code)] // Phase 4: maps to `edit.replace_range` multi-char insert path.
     pub fn insert_str(&mut self, char_idx: usize, s: &str) {
+        let (start_byte, row, col) = self.byte_row_col_at_char(char_idx);
+        let (new_end_row, new_end_col) = advance_by(row, col, s);
         self.rope.insert(char_idx, s);
-        self.touch();
+        self.push_edit(Edit {
+            start_byte,
+            old_end_byte: start_byte,
+            new_end_byte: start_byte + s.len(),
+            start_row: row,
+            start_col: col,
+            old_end_row: row,
+            old_end_col: col,
+            new_end_row,
+            new_end_col,
+        });
     }
 
     pub fn delete_range(&mut self, char_range: Range<usize>) {
         if char_range.start >= char_range.end {
             return;
         }
+        let (start_byte, start_row, start_col) = self.byte_row_col_at_char(char_range.start);
+        let (end_byte, end_row, end_col) = self.byte_row_col_at_char(char_range.end);
         self.rope.remove(char_range);
-        self.touch();
+        self.push_edit(Edit {
+            start_byte,
+            old_end_byte: end_byte,
+            new_end_byte: start_byte,
+            start_row,
+            start_col,
+            old_end_row: end_row,
+            old_end_col: end_col,
+            new_end_row: start_row,
+            new_end_col: start_col,
+        });
     }
 
     /// Structural replacement: swap the byte range (typically the byte
@@ -56,13 +118,28 @@ impl Buffer {
     /// will expose it over MCP.
     #[allow(dead_code)] // Phase 4: exposed as `edit.replace_node` over MCP.
     pub fn replace_node(&mut self, byte_range: Range<usize>, text: &str) {
-        let start = self.rope.byte_to_char(byte_range.start);
-        let end = self.rope.byte_to_char(byte_range.end);
-        if start < end {
-            self.rope.remove(start..end);
+        let (start_row, start_col) = self.row_col_at_byte(byte_range.start);
+        let (old_end_row, old_end_col) = self.row_col_at_byte(byte_range.end);
+        let start_byte = byte_range.start;
+        let old_end_byte = byte_range.end;
+        let start_char = self.rope.byte_to_char(start_byte);
+        let end_char = self.rope.byte_to_char(old_end_byte);
+        if start_char < end_char {
+            self.rope.remove(start_char..end_char);
         }
-        self.rope.insert(start, text);
-        self.touch();
+        self.rope.insert(start_char, text);
+        let (new_end_row, new_end_col) = advance_by(start_row, start_col, text);
+        self.push_edit(Edit {
+            start_byte,
+            old_end_byte,
+            new_end_byte: start_byte + text.len(),
+            start_row,
+            start_col,
+            old_end_row,
+            old_end_col,
+            new_end_row,
+            new_end_col,
+        });
     }
 
     pub fn save(&mut self) -> Result<usize> {
@@ -129,8 +206,44 @@ impl Buffer {
         self.path.as_deref()
     }
 
+    /// Hand off the queued edits to the syntax layer. Returning the Vec
+    /// (instead of `&[Edit]`) lets the caller forward it without holding
+    /// a borrow on the Buffer during the reparse.
+    pub fn drain_edits(&mut self) -> Vec<Edit> {
+        std::mem::take(&mut self.pending_edits)
+    }
+
+    fn byte_row_col_at_char(&self, char_idx: usize) -> (usize, usize, usize) {
+        let byte = self.rope.char_to_byte(char_idx);
+        let row = self.rope.char_to_line(char_idx);
+        let col = byte - self.rope.line_to_byte(row);
+        (byte, row, col)
+    }
+
+    fn row_col_at_byte(&self, byte_idx: usize) -> (usize, usize) {
+        let row = self.rope.byte_to_line(byte_idx);
+        let col = byte_idx - self.rope.line_to_byte(row);
+        (row, col)
+    }
+
+    fn push_edit(&mut self, edit: Edit) {
+        self.pending_edits.push(edit);
+        self.touch();
+    }
+
     fn touch(&mut self) {
         self.version = self.version.wrapping_add(1);
         self.dirty = true;
+    }
+}
+
+/// Given a starting `(row, col)` byte-coordinate and an inserted string,
+/// return the `(row, col)` coordinate immediately after the insertion.
+fn advance_by(row: usize, col: usize, s: &str) -> (usize, usize) {
+    if let Some(last_nl) = s.rfind('\n') {
+        let nl_count = s.as_bytes().iter().filter(|&&b| b == b'\n').count();
+        (row + nl_count, s.len() - last_nl - 1)
+    } else {
+        (row, col + s.len())
     }
 }

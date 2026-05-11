@@ -1,27 +1,27 @@
 //! Phase 2 — Tree-sitter integration.
 //!
-//! Today this module only powers syntax highlighting; the parser machinery
-//! it sets up is also the foundation `ast.query` / `edit.replace_node`
-//! (DESIGN.md §Edits, tier 2) will sit on later in the phase.
+//! Owns the parser, the cached parse tree, and the compiled Rust highlights
+//! query. `refresh` applies pending edits to the cached tree, reparses
+//! incrementally, then runs the query against the new tree to produce
+//! per-line highlight spans for the renderer. Same tree backs `ast.query`
+//! and the byte-coordinate inputs to `edit.replace_node`.
 //!
-//! The flow:
-//!   App::apply mutates Buffer -> Buffer::version bumps -> App calls
-//!   Syntax::refresh, which re-runs tree-sitter-highlight against the whole
-//!   rope and caches per-line `HighlightSpan`s. `ui.rs` reads those spans
-//!   to colorize the visible lines.
+//! Highlighting runs as a manual `QueryCursor` pass with longest-span /
+//! later-pattern precedence (Phase 2.5b — dropped the `tree-sitter-highlight`
+//! crate so we own the only parse).
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use ratatui::style::{Color, Modifier, Style};
 use ropey::Rope;
-use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
-use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
+use tree_sitter::{InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree};
 
-/// Highlight names we know how to style. The order is significant: the index
-/// of a name here is what tree-sitter-highlight returns as the `Highlight` id
-/// for every match against that capture, so `style_for` switches on this
-/// table.
+use crate::buffer::{Buffer, Edit};
+
+/// Highlight names we know how to style. `build_capture_map` matches each
+/// query capture name to its longest prefix in this list, and the resulting
+/// index is what `style_for` switches on.
 const HIGHLIGHT_NAMES: &[&str] = &[
     "attribute",
     "comment",
@@ -72,8 +72,12 @@ pub struct AstMatch {
 pub struct Syntax {
     parser: Parser,
     tree: Option<Tree>,
-    highlighter: Highlighter,
-    config: HighlightConfiguration,
+    language: Language,
+    highlight_query: Query,
+    /// Maps `highlight_query.capture_names()[i]` to its `HIGHLIGHT_NAMES`
+    /// index, or `None` when the capture (e.g. a predicate parameter) is
+    /// not a visible highlight.
+    capture_map: Vec<Option<usize>>,
     cached_version: Option<u64>,
     per_line: Vec<Vec<HighlightSpan>>,
 }
@@ -90,83 +94,109 @@ impl Syntax {
     }
 
     fn rust() -> Result<Self> {
-        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let language: Language = tree_sitter_rust::LANGUAGE.into();
         let mut parser = Parser::new();
         parser
             .set_language(&language)
             .context("loading rust grammar into parser")?;
-        let mut config = HighlightConfiguration::new(
-            language,
-            "rust",
-            tree_sitter_rust::HIGHLIGHTS_QUERY,
-            tree_sitter_rust::INJECTIONS_QUERY,
-            "",
-        )
-        .context("building rust highlight configuration")?;
-        config.configure(HIGHLIGHT_NAMES);
+        let highlight_query = Query::new(&language, tree_sitter_rust::HIGHLIGHTS_QUERY)
+            .context("compiling rust highlights query")?;
+        let capture_map = build_capture_map(&highlight_query, HIGHLIGHT_NAMES);
         Ok(Self {
             parser,
             tree: None,
-            highlighter: Highlighter::new(),
-            config,
+            language,
+            highlight_query,
+            capture_map,
             cached_version: None,
             per_line: Vec::new(),
         })
     }
 
     /// Re-parse the tree and re-run highlighting if the buffer has changed
-    /// since the last refresh.
-    pub fn refresh(&mut self, rope: &Rope, version: u64) {
+    /// since the last refresh. Pending edits are applied to the cached tree
+    /// first, so the reparse is incremental — tree-sitter only walks the
+    /// changed region (DESIGN.md §Edits is implicit on this).
+    pub fn refresh(&mut self, buffer: &mut Buffer) {
+        let version = buffer.version();
         if self.cached_version == Some(version) {
+            // Already in sync; still drain the buffer's edit queue so it
+            // doesn't accumulate stale entries across no-op refreshes.
+            let _ = buffer.drain_edits();
             return;
         }
         self.cached_version = Some(version);
+        let edits = buffer.drain_edits();
+        if let Some(tree) = self.tree.as_mut() {
+            for e in &edits {
+                tree.edit(&to_input_edit(e));
+            }
+        }
+
+        let rope = buffer.rope();
         self.per_line.clear();
         self.per_line.resize(rope.len_lines(), Vec::new());
 
-        // Materialize the rope as a contiguous byte slice. We share it
-        // between the parser and the highlighter; the per-keystroke copy
-        // is the obvious Phase-2.5 optimization target.
+        // Materialize the rope as a contiguous byte slice. The parser
+        // and the highlight query both consume it; we own the only parse.
         let text: String = rope.to_string();
-        // Pass `None` as the old tree — incremental reparse via `Tree::edit`
-        // is the Phase-2.5 follow-up.
-        self.tree = self.parser.parse(text.as_bytes(), None);
-
-        let events = match self
-            .highlighter
-            .highlight(&self.config, text.as_bytes(), None, |_| None)
-        {
-            Ok(e) => e,
-            Err(_) => return,
+        self.tree = self.parser.parse(text.as_bytes(), self.tree.as_ref());
+        let Some(tree) = self.tree.as_ref() else {
+            return;
         };
 
-        // We first drain the iterator into a flat list of (byte_start, byte_end,
-        // capture_idx). We can't write into `self.per_line` directly because
-        // `events` borrows `self.highlighter` mutably for the lifetime of the loop.
-        let mut raw: Vec<(usize, usize, usize)> = Vec::new();
-        let mut stack: Vec<usize> = Vec::new();
+        // Collect every (pattern_index, byte_start, byte_end, highlight_idx).
+        // We need to drain into an owned Vec so the QueryCursor borrow on
+        // self.highlight_query ends before we touch self.per_line.
         let len_bytes = text.len();
-        for ev in events.flatten() {
-            match ev {
-                HighlightEvent::HighlightStart(h) => stack.push(h.0),
-                HighlightEvent::HighlightEnd => {
-                    stack.pop();
-                }
-                HighlightEvent::Source { start, end } => {
-                    let Some(&idx) = stack.last() else {
+        let mut collected: Vec<(usize, usize, usize, usize)> = Vec::new();
+        {
+            let mut cursor = QueryCursor::new();
+            let mut iter = cursor.matches(&self.highlight_query, tree.root_node(), text.as_bytes());
+            while let Some(m) = iter.next() {
+                for cap in m.captures {
+                    let Some(h_idx) = self
+                        .capture_map
+                        .get(cap.index as usize)
+                        .copied()
+                        .flatten()
+                    else {
                         continue;
                     };
-                    let end = end.min(len_bytes);
-                    if start >= end {
-                        continue;
+                    let s = cap.node.start_byte().min(len_bytes);
+                    let e = cap.node.end_byte().min(len_bytes);
+                    if s < e {
+                        collected.push((m.pattern_index, s, e, h_idx));
                     }
-                    raw.push((start, end, idx));
                 }
             }
         }
-        drop(stack);
-        for (b0, b1, idx) in raw {
-            split_into_lines(&mut self.per_line, rope, b0, b1, idx);
+
+        // Paint precedence: outer (longest) spans first so inner ones
+        // overwrite them, then later patterns override earlier ones on
+        // ties. This mirrors what tree-sitter-highlight does with its
+        // stack-of-active-captures, without the event-stream machinery.
+        collected.sort_by_key(|&(pat, s, e, _)| (std::cmp::Reverse(e - s), pat));
+        let mut painted: Vec<u32> = vec![u32::MAX; len_bytes];
+        for &(_, s, e, h) in &collected {
+            painted[s..e].fill(h as u32);
+        }
+
+        // Walk runs of equal capture index out of the painted buffer,
+        // splitting each run into the per-line span list the renderer
+        // consumes.
+        let mut i = 0;
+        while i < len_bytes {
+            let v = painted[i];
+            if v == u32::MAX {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < len_bytes && painted[i] == v {
+                i += 1;
+            }
+            split_into_lines(&mut self.per_line, rope, start, i, v as usize);
         }
     }
 
@@ -188,7 +218,7 @@ impl Syntax {
     #[allow(dead_code)] // Phase 4: exposed as `ast.query` over MCP.
     pub fn ast_query(&self, rope: &Rope, query_src: &str) -> Result<Vec<AstMatch>> {
         let tree = self.tree.as_ref().context("buffer has not been parsed")?;
-        let query = Query::new(&self.config.language, query_src)
+        let query = Query::new(&self.language, query_src)
             .context("compiling tree-sitter query")?;
         let names = query.capture_names();
         let text = rope.to_string();
@@ -257,6 +287,42 @@ fn split_into_lines(
     }
 }
 
+/// For each capture name in `query`, find the longest entry in `recognized`
+/// that is either equal to it or is a dotted prefix of it. The chosen
+/// index is what `style_for` switches on; `None` means the capture is a
+/// query-internal name (predicate parameters, injection scaffolding) and
+/// should not be painted.
+fn build_capture_map(query: &Query, recognized: &[&str]) -> Vec<Option<usize>> {
+    query
+        .capture_names()
+        .iter()
+        .map(|cap_name| {
+            recognized
+                .iter()
+                .enumerate()
+                .filter(|&(_, &rn)| {
+                    *cap_name == rn
+                        || (cap_name.len() > rn.len()
+                            && cap_name.starts_with(rn)
+                            && cap_name.as_bytes()[rn.len()] == b'.')
+                })
+                .max_by_key(|&(_, &rn)| rn.len())
+                .map(|(i, _)| i)
+        })
+        .collect()
+}
+
+fn to_input_edit(e: &Edit) -> InputEdit {
+    InputEdit {
+        start_byte: e.start_byte,
+        old_end_byte: e.old_end_byte,
+        new_end_byte: e.new_end_byte,
+        start_position: Point::new(e.start_row, e.start_col),
+        old_end_position: Point::new(e.old_end_row, e.old_end_col),
+        new_end_position: Point::new(e.new_end_row, e.new_end_col),
+    }
+}
+
 fn printable_line_len(rope: &Rope, line: usize) -> usize {
     let s = rope.line(line);
     let n = s.len_chars();
@@ -292,7 +358,13 @@ pub fn style_for(capture_idx: usize) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::Buffer;
+
+    fn scratch_buffer(name: &str) -> Buffer {
+        let path = std::env::temp_dir()
+            .join(format!("dyad_test_{}_{}.rs", name, std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Buffer::open(path).unwrap()
+    }
 
     fn slice(rope: &Rope, byte_start: usize, byte_end: usize) -> String {
         let cs = rope.byte_to_char(byte_start);
@@ -302,31 +374,27 @@ mod tests {
 
     #[test]
     fn ast_query_finds_function_names() {
+        let mut buf = scratch_buffer("ast_query");
+        buf.insert_str(0, "fn hello() {}\nfn world() {}\n");
         let mut syn = Syntax::rust().unwrap();
-        let rope = Rope::from_str("fn hello() {}\nfn world() {}\n");
-        syn.refresh(&rope, 1);
+        syn.refresh(&mut buf);
         let matches = syn
-            .ast_query(&rope, "(function_item name: (identifier) @name)")
+            .ast_query(buf.rope(), "(function_item name: (identifier) @name)")
             .unwrap();
         let names: Vec<String> = matches
             .into_iter()
             .filter(|m| m.capture == "name")
-            .map(|m| slice(&rope, m.byte_start, m.byte_end))
+            .map(|m| slice(buf.rope(), m.byte_start, m.byte_end))
             .collect();
         assert_eq!(names, vec!["hello".to_string(), "world".to_string()]);
     }
 
     #[test]
     fn replace_node_renames_function() {
-        // Use a non-existent path so Buffer::open returns an empty rope.
-        let path = std::env::temp_dir()
-            .join(format!("dyad_test_replace_node_{}.rs", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let mut buf = Buffer::open(path).unwrap();
+        let mut buf = scratch_buffer("replace_node");
         buf.insert_str(0, "fn hello() {}\n");
-
         let mut syn = Syntax::rust().unwrap();
-        syn.refresh(buf.rope(), buf.version());
+        syn.refresh(&mut buf);
         let matches = syn
             .ast_query(buf.rope(), "(function_item name: (identifier) @name)")
             .unwrap();
@@ -341,5 +409,64 @@ mod tests {
         assert_eq!(buf.rope().to_string(), "fn world() {}\n");
         assert_ne!(buf.version(), before_version);
         assert!(buf.is_dirty());
+    }
+
+    fn name_to_idx(name: &str) -> usize {
+        HIGHLIGHT_NAMES.iter().position(|n| *n == name).unwrap()
+    }
+
+    /// Phase 2.5b: our homegrown highlight pass should mark the `fn`
+    /// keyword and the function-name identifier with the right captures.
+    #[test]
+    fn highlight_spans_cover_keyword_and_function_name() {
+        let mut buf = scratch_buffer("highlight");
+        buf.insert_str(0, "fn hello() {}\n");
+        let mut syn = Syntax::rust().unwrap();
+        syn.refresh(&mut buf);
+
+        let line0 = syn.line_spans(0);
+        let keyword_idx = name_to_idx("keyword");
+        let function_idx = name_to_idx("function");
+
+        let fn_span = line0
+            .iter()
+            .find(|s| s.col_start == 0 && s.col_end == 2)
+            .expect("`fn` keyword span");
+        assert_eq!(fn_span.capture_idx, keyword_idx);
+
+        let name_span = line0
+            .iter()
+            .find(|s| s.col_start == 3 && s.col_end == 8)
+            .expect("`hello` function-name span");
+        assert_eq!(name_span.capture_idx, function_idx);
+    }
+
+    /// After an incremental edit, ast_query should still see the new state.
+    /// This exercises the Tree::edit + reparse-with-old-tree path.
+    #[test]
+    fn incremental_reparse_tracks_renames() {
+        let mut buf = scratch_buffer("incremental");
+        buf.insert_str(0, "fn hello() {}\n");
+        let mut syn = Syntax::rust().unwrap();
+        syn.refresh(&mut buf);
+
+        // Drive an incremental refresh: rename `hello` -> `farewell`.
+        let target = syn
+            .ast_query(buf.rope(), "(function_item name: (identifier) @name)")
+            .unwrap()
+            .into_iter()
+            .find(|m| m.capture == "name")
+            .unwrap();
+        buf.replace_node(target.byte_start..target.byte_end, "farewell");
+        syn.refresh(&mut buf);
+
+        let names: Vec<String> = syn
+            .ast_query(buf.rope(), "(function_item name: (identifier) @name)")
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.capture == "name")
+            .map(|m| slice(buf.rope(), m.byte_start, m.byte_end))
+            .collect();
+        assert_eq!(names, vec!["farewell".to_string()]);
     }
 }

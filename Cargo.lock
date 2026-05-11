@@ -398,7 +398,6 @@ dependencies = [
  "ratatui",
  "ropey",
  "tree-sitter",
- "tree-sitter-highlight",
  "tree-sitter-rust",
 ]
 
@@ -1557,18 +1556,6 @@ dependencies = [
  "serde_json",
  "streaming-iterator",
  "tree-sitter-language",
-]
-
-[[package]]
-name = "tree-sitter-highlight"
-version = "0.25.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adc5f880ad8d8f94e88cb81c3557024cf1a8b75e3b504c50481ed4f5a6006ff3"
-dependencies = [
- "regex",
- "streaming-iterator",
- "thiserror 2.0.18",
- "tree-sitter",
 ]
 
 [[package]]

@@ -23,10 +23,10 @@ pub struct App {
 
 impl App {
     pub fn new(path: PathBuf) -> Result<Self> {
-        let buffer = Buffer::open(path)?;
+        let mut buffer = Buffer::open(path)?;
         let mut syntax = Syntax::for_path(buffer.path());
         if let Some(syn) = syntax.as_mut() {
-            syn.refresh(buffer.rope(), buffer.version());
+            syn.refresh(&mut buffer);
         }
         Ok(Self {
             buffer,
@@ -131,7 +131,7 @@ impl App {
         self.view.scroll_into_view(viewport);
 
         if let Some(syn) = self.syntax.as_mut() {
-            syn.refresh(self.buffer.rope(), self.buffer.version());
+            syn.refresh(&mut self.buffer);
         }
 
         Ok(())
