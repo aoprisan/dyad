@@ -12,6 +12,7 @@ use crate::git::{self, LineStatus};
 use crate::input;
 use crate::lsp::{self, LspClient};
 use crate::syntax::Syntax;
+use crate::tree::{self, Activation, FileTree};
 use crate::tx::TxManager;
 use crate::ui;
 use crate::view::View;
@@ -43,6 +44,10 @@ pub struct App {
     nav_stack: Vec<NavPoint>,
     tx_manager: TxManager,
     quit_pending: bool,
+    /// Left-sidebar file tree. Always present so Ctrl-T can show it
+    /// without the App needing to know about lazy initialization.
+    /// `tree.focused` doubles as the visibility flag.
+    pub tree: FileTree,
 }
 
 struct NavPoint {
@@ -53,6 +58,9 @@ struct NavPoint {
 
 impl App {
     pub fn new(path: PathBuf) -> Result<Self> {
+        if path.is_dir() {
+            return Self::new_for_dir(path);
+        }
         let mut buffer = Buffer::open(path)?;
         let mut syntax = Syntax::for_path(buffer.path());
         if let Some(syn) = syntax.as_mut() {
@@ -60,6 +68,11 @@ impl App {
         }
         let git_status = compute_git_status(buffer.path());
         let (lsp, lsp_uri, lsp_attempted) = spawn_lsp(&buffer);
+        let tree_root = buffer
+            .path()
+            .and_then(|p| p.parent())
+            .map(tree::project_root_for)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         Ok(Self {
             buffer,
             view: View::new(),
@@ -74,6 +87,30 @@ impl App {
             nav_stack: Vec::new(),
             tx_manager: TxManager::new(),
             quit_pending: false,
+            tree: FileTree::new(tree_root),
+        })
+    }
+
+    /// Launch with `dyad <dir>`: no buffer is loaded yet; the tree is
+    /// visible and focused so the user can pick a file from disk.
+    fn new_for_dir(dir: PathBuf) -> Result<Self> {
+        let mut tree = FileTree::new(tree::project_root_for(&dir));
+        tree.focused = true;
+        Ok(Self {
+            buffer: Buffer::scratch(),
+            view: View::new(),
+            syntax: None,
+            running: true,
+            status: String::new(),
+            git_status: HashMap::new(),
+            lsp: None,
+            lsp_uri: None,
+            lsp_attempted: false,
+            lsp_version: 0,
+            nav_stack: Vec::new(),
+            tx_manager: TxManager::new(),
+            quit_pending: false,
+            tree,
         })
     }
 
@@ -107,6 +144,34 @@ impl App {
         // Any non-Quit input clears the pending-quit confirmation.
         if !matches!(action, Action::Quit) {
             self.quit_pending = false;
+        }
+
+        // Tree-mode routing. Toggle / Escape are mode-independent;
+        // everything else either drives the tree or is swallowed
+        // while the sidebar holds focus, with Save/Quit explicitly
+        // passed through so the user is never locked in.
+        match action {
+            Action::ToggleTree => {
+                self.tree.focused = !self.tree.focused;
+                return Ok(());
+            }
+            Action::Escape => {
+                if self.tree.focused {
+                    self.tree.focused = false;
+                }
+                return Ok(());
+            }
+            Action::Save | Action::Quit => {}
+            _ if self.tree.focused => {
+                match action {
+                    Action::MoveUp => self.tree.move_up(),
+                    Action::MoveDown => self.tree.move_down(),
+                    Action::Insert('\n') => self.tree_activate()?,
+                    _ => {}
+                }
+                return Ok(());
+            }
+            _ => {}
         }
 
         // Open an auto-tx for buffer-mutating actions so every edit lands
@@ -144,6 +209,8 @@ impl App {
             Action::MoveRight => self.view.move_right(&self.buffer),
             Action::MoveUp => self.view.move_up(&self.buffer),
             Action::MoveDown => self.view.move_down(&self.buffer),
+            Action::MoveWordLeft => self.view.move_word_left(&self.buffer),
+            Action::MoveWordRight => self.view.move_word_right(&self.buffer),
             Action::MoveHome => self.view.move_home(),
             Action::MoveEnd => self.view.move_end(&self.buffer),
             Action::PageUp | Action::PageDown => {
@@ -178,6 +245,9 @@ impl App {
             Action::GoBack => {
                 self.status = self.go_back();
             }
+            // Handled in the tree-routing block above; listed here so the
+            // compiler stays happy about exhaustiveness.
+            Action::ToggleTree | Action::Escape => {}
         }
 
         // Close out the auto-tx. If the mutation didn't actually change
@@ -300,6 +370,38 @@ impl App {
         }
     }
 
+    /// Enter on the tree's selected entry. Directories toggle open/closed
+    /// in place; the `..` row re-roots one level up; files load into the
+    /// buffer and return focus to the editor. Refuses with a status
+    /// message when the current buffer is dirty — same policy as
+    /// cross-file go-to-definition.
+    fn tree_activate(&mut self) -> Result<()> {
+        let path = match self.tree.activate() {
+            Activation::None => return Ok(()),
+            Activation::Ascend => {
+                self.tree.ascend();
+                return Ok(());
+            }
+            Activation::Open(p) => p,
+        };
+        if self.buffer.is_dirty() {
+            self.status = "Save first — current buffer has unsaved changes".into();
+            return Ok(());
+        }
+        self.push_nav_stack();
+        match self.open_file(&path) {
+            Ok(()) => {
+                self.tree.focused = false;
+                self.status = String::new();
+            }
+            Err(e) => {
+                self.nav_stack.pop();
+                self.status = format!("Could not open {}: {e}", path.display());
+            }
+        }
+        Ok(())
+    }
+
     /// Swap the current buffer for one rooted at `path`. Resets the view,
     /// re-runs the tree-sitter parse, refreshes git status, and tells the
     /// existing LSP client about the new file. The LSP client itself is
@@ -312,11 +414,27 @@ impl App {
         }
         let new_git_status = compute_git_status(new_buffer.path());
         let new_uri = new_buffer.path().map(lsp::path_to_uri);
+        let is_rust = new_buffer
+            .path()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            == Some("rs");
 
-        // Notify LSP about the new document if we have one running and
-        // it's a Rust file. didOpen-on-already-open is well-tolerated by
-        // rust-analyzer (it replaces its view of the document).
-        if let (Some(lsp), Some(uri), Some(p)) = (
+        // rust-analyzer is a single workspace-wide instance. Two paths:
+        //   - if it's already running, send didOpen so it picks up the
+        //     new doc (it tolerates didOpen on a known doc — replaces
+        //     its view);
+        //   - if it isn't, this is the first Rust file we've seen, so
+        //     lazy-spawn it. This is what makes `dyad <dir>` followed
+        //     by picking a `.rs` file from the tree behave the same as
+        //     `dyad <file.rs>` from the command line.
+        if self.lsp.is_none() && is_rust {
+            let (lsp, _spawned_uri, attempted) = spawn_lsp(&new_buffer);
+            self.lsp = lsp;
+            self.lsp_attempted = attempted;
+            // spawn_rust already issued didOpen with the file's content;
+            // the else-branch's didOpen call would be redundant.
+        } else if let (Some(lsp), Some(uri), Some(p)) = (
             self.lsp.as_ref(),
             new_uri.as_ref(),
             new_buffer.path(),
@@ -370,6 +488,8 @@ fn action_intent(action: &Action) -> Option<String> {
         | Action::MoveRight
         | Action::MoveUp
         | Action::MoveDown
+        | Action::MoveWordLeft
+        | Action::MoveWordRight
         | Action::MoveHome
         | Action::MoveEnd
         | Action::PageUp
@@ -377,7 +497,9 @@ fn action_intent(action: &Action) -> Option<String> {
         | Action::Save
         | Action::Quit
         | Action::GoToDefinition
-        | Action::GoBack => None,
+        | Action::GoBack
+        | Action::ToggleTree
+        | Action::Escape => None,
     }
 }
 

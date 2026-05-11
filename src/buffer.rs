@@ -67,6 +67,19 @@ impl Buffer {
         })
     }
 
+    /// Empty buffer with no path. Used when `dyad` is launched on a
+    /// directory: the tree is the user's entry point and the editor
+    /// waits with this scratch buffer until they pick a file.
+    pub fn scratch() -> Self {
+        Self {
+            rope: Rope::new(),
+            path: None,
+            version: 0,
+            dirty: false,
+            pending_edits: Vec::new(),
+        }
+    }
+
     pub fn insert_char(&mut self, char_idx: usize, c: char) {
         let (start_byte, row, col) = self.byte_row_col_at_char(char_idx);
         let c_len = c.len_utf8();

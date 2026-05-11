@@ -52,6 +52,28 @@ pub fn status_hint() -> Style {
     Style::default().bg(BASE02).fg(BASE01)
 }
 
+// ---------- file-tree roles ----------
+
+/// Default sidebar surface. Same backdrop as the editor so the split
+/// reads as one document with chrome on the side, not a separate panel.
+pub fn tree() -> Style {
+    Style::default().bg(BASE03).fg(BASE0)
+}
+
+/// Selected row in the file tree (when the sidebar is focused).
+pub fn tree_selected() -> Style {
+    Style::default()
+        .bg(BASE02)
+        .fg(BASE1)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Directory entries — picked out in blue so they read distinctly from
+/// files at the same indent level.
+pub fn tree_dir() -> Style {
+    Style::default().bg(BASE03).fg(BLUE)
+}
+
 // ---------- badge / diagnostic / git roles ----------
 
 pub fn ok() -> Color {

@@ -7,8 +7,9 @@ use crate::app::App;
 use crate::git::LineStatus;
 use crate::syntax::{self, HighlightSpan};
 use crate::theme;
+use crate::tree::FileTree;
 
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -17,6 +18,18 @@ pub fn render(frame: &mut Frame, app: &App) {
     let content_area = chunks[0];
     let status_area = chunks[1];
 
+    // Sidebar split: only when the tree is open. Keep the editor full
+    // width otherwise so single-file workflows have no left margin.
+    let (tree_rect, editor_area) = if app.tree.focused {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(TREE_WIDTH), Constraint::Min(1)])
+            .split(content_area);
+        (Some(split[0]), split[1])
+    } else {
+        (None, content_area)
+    };
+
     let gutter_width = gutter_width(app.buffer.line_count());
     let content_split = Layout::default()
         .direction(Direction::Horizontal)
@@ -24,14 +37,73 @@ pub fn render(frame: &mut Frame, app: &App) {
             Constraint::Length(gutter_width),
             Constraint::Min(1),
         ])
-        .split(content_area);
+        .split(editor_area);
     let gutter_rect = content_split[0];
     let text_rect = content_split[1];
 
+    if let Some(rect) = tree_rect {
+        render_tree(frame, rect, &mut app.tree);
+    }
     render_gutter(frame, gutter_rect, app, gutter_width);
     render_text(frame, text_rect, app);
     render_status(frame, status_area, app);
-    place_cursor(frame, text_rect, app);
+    if !app.tree.focused {
+        place_cursor(frame, text_rect, app);
+    }
+}
+
+const TREE_WIDTH: u16 = 30;
+
+fn render_tree(frame: &mut Frame, rect: Rect, tree: &mut FileTree) {
+    let width = rect.width as usize;
+    // First row is a header showing the project root's last segment so
+    // the user can tell at a glance which folder they're browsing. The
+    // remaining rows host the entry list.
+    let list_viewport = (rect.height as usize).saturating_sub(1);
+    tree.scroll_into_view(list_viewport);
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rect.height as usize);
+    let root_label = tree
+        .root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| tree.root.display().to_string());
+    let header = truncate_to(&format!(" {root_label} "), width);
+    lines.push(Line::from(Span::styled(header, theme::status_bar())));
+
+    for r in 0..list_viewport {
+        let idx = tree.top + r;
+        let Some(entry) = tree.entries.get(idx) else {
+            lines.push(Line::raw(""));
+            continue;
+        };
+        let icon = if entry.is_parent_link {
+            "↰ "
+        } else if entry.is_dir {
+            if entry.expanded { "▾ " } else { "▸ " }
+        } else {
+            "  "
+        };
+        let indent = "  ".repeat(entry.depth);
+        let text = truncate_to(&format!("{indent}{icon}{}", entry.name), width);
+        let style = if idx == tree.cursor {
+            theme::tree_selected()
+        } else if entry.is_dir {
+            theme::tree_dir()
+        } else {
+            theme::tree()
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    frame.render_widget(Paragraph::new(lines).style(theme::tree()), rect);
+}
+
+fn truncate_to(s: &str, width: usize) -> String {
+    if s.chars().count() > width {
+        s.chars().take(width).collect()
+    } else {
+        s.to_string()
+    }
 }
 
 fn gutter_width(line_count: usize) -> u16 {
@@ -168,6 +240,8 @@ fn render_status(frame: &mut Frame, rect: Rect, app: &App) {
     } else if let Some((label, severity)) = current_line_diagnostic(app) {
         let style = theme::status_bar().fg(theme::diagnostic(severity));
         (label, style)
+    } else if app.tree.focused {
+        (TREE_HINT_TEXT.to_string(), hint)
     } else {
         (HINT_TEXT.to_string(), hint)
     };
@@ -210,7 +284,10 @@ fn lsp_badge_span(app: &App) -> Option<Span<'static>> {
 }
 
 const HINT_TEXT: &str =
-    " Ctrl-S save · Ctrl-G def · Ctrl-O back · Ctrl-Q quit · Alt+h/j/k/l move ";
+    " Ctrl-T tree · Ctrl-S save · Ctrl-G def · Ctrl-O back · Ctrl-Q quit ";
+
+const TREE_HINT_TEXT: &str =
+    " ↑/↓ move · Enter open · Esc close · Ctrl-T toggle ";
 
 /// First LSP diagnostic that starts on the cursor line, formatted for
 /// the status bar. Returns `(text, severity)` so the caller can colorize.

@@ -7,6 +7,8 @@ pub enum Action {
     MoveRight,
     MoveUp,
     MoveDown,
+    MoveWordLeft,
+    MoveWordRight,
     MoveHome,
     MoveEnd,
     PageUp,
@@ -15,4 +17,6 @@ pub enum Action {
     Quit,
     GoToDefinition,
     GoBack,
+    ToggleTree,
+    Escape,
 }
