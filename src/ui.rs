@@ -695,6 +695,30 @@ fn render_status(frame: &mut Frame, rect: Rect, app: &App) {
         frame.render_widget(Paragraph::new(Line::from(spans)), rect);
         return;
     }
+    // The diff overlay needs its own status bar so the key hints stay
+    // visible after stage/unstage/commit — the generic path below would
+    // let `app.status` replace the hint and leave the user without a
+    // discoverability cue.
+    if app.diff.is_some() {
+        let bar = theme::status_bar();
+        let hint_style = theme::status_hint();
+        let left = if !app.status.is_empty() {
+            format!(" {} ", app.status)
+        } else {
+            " Git status ".to_string()
+        };
+        let right = DIFF_HINT_TEXT.to_string();
+        let total_width = rect.width as usize;
+        let pad = total_width
+            .saturating_sub(left.chars().count() + right.chars().count());
+        let spans = vec![
+            Span::styled(left, bar),
+            Span::styled(" ".repeat(pad), bar),
+            Span::styled(right, hint_style),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+        return;
+    }
     let path = match app.buffer.path() {
         Some(p) => p.display().to_string(),
         None => "[scratch]".into(),
@@ -718,8 +742,6 @@ fn render_status(frame: &mut Frame, rect: Rect, app: &App) {
         (KEYS_HINT_TEXT.to_string(), hint)
     } else if app.history.is_some() {
         (HISTORY_HINT_TEXT.to_string(), hint)
-    } else if app.diff.is_some() {
-        (DIFF_HINT_TEXT.to_string(), hint)
     } else if app.tree.focused {
         (TREE_HINT_TEXT.to_string(), hint)
     } else {
