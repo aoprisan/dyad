@@ -3,7 +3,9 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, GitFile, GitGroup, GitView, HistoryView, OpenFileView, TypeSearchView};
+use crate::app::{
+    App, GitFile, GitGroup, GitView, HistoryView, OpenFileView, TextSearchView, TypeSearchView,
+};
 use crate::git::LineStatus;
 use crate::syntax::{self, HighlightSpan};
 use crate::theme;
@@ -47,13 +49,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Overlays take over the editor area (gutter + text) when open
     // so the user can scroll long content without fighting the syntax
     // viewport. Tree sidebar stays visible alongside if open.
-    // Precedence: keys help > open-file > type-search > history > diff > normal.
+    // Precedence: keys help > open-file > type-search > text-search > history > diff > normal.
     if app.keys_help {
         render_keys_help(frame, editor_area);
     } else if let Some(view) = app.open_file.as_ref() {
         render_open_file(frame, editor_area, view);
     } else if let Some(view) = app.type_search.as_ref() {
         render_type_search(frame, editor_area, view);
+    } else if let Some(view) = app.text_search.as_ref() {
+        render_text_search(frame, editor_area, view);
     } else if app.history.is_some() {
         render_history(frame, editor_area, app);
     } else if app.diff.is_some() {
@@ -66,6 +70,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if !app.keys_help
         && app.open_file.is_none()
         && app.type_search.is_none()
+        && app.text_search.is_none()
         && app.diff.is_none()
         && app.history.is_none()
         && !app.tree.focused
@@ -278,6 +283,39 @@ fn render_type_search(frame: &mut Frame, rect: Rect, view: &TypeSearchView) {
     frame.render_widget(Paragraph::new(lines).style(theme::editor()), rect);
 }
 
+fn render_text_search(frame: &mut Frame, rect: Rect, view: &TextSearchView) {
+    let viewport = rect.height as usize;
+    let width = rect.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport);
+    if view.results.is_empty() {
+        lines.push(Line::from(Span::styled(
+            truncate_to(&format!(" {}", view.status), width),
+            theme::status_hint(),
+        )));
+    } else {
+        let top = scroll_top(view.cursor, viewport, view.results.len());
+        for r in 0..viewport {
+            let row_idx = top + r;
+            let Some(hit) = view.results.get(row_idx) else {
+                lines.push(Line::raw(""));
+                continue;
+            };
+            let marker = if row_idx == view.cursor { "▸ " } else { "  " };
+            // File:line then preview, split so the path stays scan-able
+            // when the preview is long and gets truncated.
+            let location = format!("{}:{}", hit.path.display(), hit.line + 1);
+            let label = format!("{marker}{location}  {}", hit.preview);
+            let style = if row_idx == view.cursor {
+                theme::tree_selected()
+            } else {
+                theme::editor()
+            };
+            lines.push(Line::from(Span::styled(truncate_to(&label, width), style)));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).style(theme::editor()), rect);
+}
+
 fn render_keys_help(frame: &mut Frame, rect: Rect) {
     let viewport = rect.height as usize;
     let width = rect.width as usize;
@@ -327,7 +365,7 @@ const KEYS_HELP: &[KeyRow] = &[
     KeyRow::Binding("Ctrl-W", "toggle autosave (~500ms idle)"),
     KeyRow::Binding("Ctrl-Q", "quit (twice when dirty)"),
     KeyRow::Section("LSP"),
-    KeyRow::Binding("Ctrl-G then …", "go prefix: d/g=def, t=type, l/v=line, b=back"),
+    KeyRow::Binding("Ctrl-G then …", "go prefix: d/g=def, t=type, f=find text, l/v=line, b=back"),
     KeyRow::Binding("Ctrl-O", "back (nav stack)"),
     KeyRow::Binding("Ctrl-K", "show type at cursor"),
     KeyRow::Binding("Ctrl-Y", "rename symbol"),
@@ -637,6 +675,22 @@ fn render_status(frame: &mut Frame, rect: Rect, app: &App) {
         frame.render_widget(Paragraph::new(Line::from(spans)), rect);
         return;
     }
+    if let Some(view) = app.text_search.as_ref() {
+        let bar = theme::status_bar();
+        let hint_style = theme::status_hint();
+        let left = format!(" Find text: {}_", view.query);
+        let right = format!(" {} match(es) ", view.results.len());
+        let total_width = rect.width as usize;
+        let pad = total_width
+            .saturating_sub(left.chars().count() + right.chars().count());
+        let spans = vec![
+            Span::styled(left, bar),
+            Span::styled(" ".repeat(pad), bar),
+            Span::styled(right, hint_style),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+        return;
+    }
     let path = match app.buffer.path() {
         Some(p) => p.display().to_string(),
         None => "[scratch]".into(),
@@ -721,7 +775,7 @@ fn lsp_badge_span(app: &App) -> Option<Span<'static>> {
 }
 
 const HINT_TEXT: &str =
-    " Ctrl-P keys · Ctrl-X open · Ctrl-G,T type · Ctrl-V goto · Ctrl-T tree · Ctrl-K hover · Ctrl-R git · Ctrl-S save ";
+    " Ctrl-P keys · Ctrl-X open · Ctrl-G,T type · Ctrl-G,F find · Ctrl-V goto · Ctrl-T tree · Ctrl-K hover · Ctrl-R git · Ctrl-S save ";
 
 const KEYS_HINT_TEXT: &str = " Esc close · Ctrl-P toggle ";
 

@@ -82,6 +82,10 @@ pub struct App {
     /// visible; holds the user's query and the LSP-returned type hits
     /// for the current query (refreshed on each keystroke).
     pub type_search: Option<TypeSearchView>,
+    /// Ctrl-G f project-wide text-search dialog. `Some` while the
+    /// dialog is visible; holds the user's query and the per-line
+    /// matches found by walking files under the tree root.
+    pub text_search: Option<TextSearchView>,
     /// Git overlay (Ctrl-R). `Some` while the overlay is visible.
     /// Holds the change-list, the diff for the currently-selected
     /// file, and the repo root we resolved when the overlay opened
@@ -166,6 +170,39 @@ pub struct TypeHit {
     pub uri: String,
     pub line: u32,
     pub character: u32,
+}
+
+pub struct TextSearchView {
+    /// Root the search was scoped to — the tree's project root at the
+    /// moment the dialog was opened. Cached so we don't re-resolve it
+    /// on every keystroke.
+    pub root: PathBuf,
+    /// What the user has typed so far. Each non-control char or
+    /// Backspace re-walks the tree under `root`.
+    pub query: String,
+    /// Per-line hits for the current query, ordered file-then-line.
+    /// Capped by `TEXT_SEARCH_MAX_HITS` so a 2-char query against a
+    /// huge tree can't freeze the UI.
+    pub results: Vec<TextHit>,
+    pub cursor: usize,
+    pub top: usize,
+    /// Empty-state line shown when `results` is empty
+    /// ("Type to search…", "No matches for …", or a max-hits notice).
+    pub status: String,
+}
+
+#[derive(Clone)]
+pub struct TextHit {
+    /// Path of the matching file relative to `root`. Joined back with
+    /// `root` on jump so the buffer opens at an absolute path.
+    pub path: PathBuf,
+    /// 0-based line number within the file.
+    pub line: usize,
+    /// 0-based char column of the first match on the line.
+    pub col: usize,
+    /// Full line text with leading/trailing whitespace trimmed, for
+    /// rendering. Capped at `TEXT_SEARCH_PREVIEW_CHARS` to keep one row.
+    pub preview: String,
 }
 
 pub struct HistoryView {
@@ -264,6 +301,7 @@ impl App {
             keys_help: false,
             open_file: None,
             type_search: None,
+            text_search: None,
             prompt: None,
             autosave: false,
             last_edit: None,
@@ -297,6 +335,7 @@ impl App {
             keys_help: false,
             open_file: None,
             type_search: None,
+            text_search: None,
             prompt: None,
             autosave: false,
             last_edit: None,
@@ -413,6 +452,10 @@ impl App {
                 self.start_type_search_dialog();
                 return Ok(());
             }
+            Action::OpenTextSearch => {
+                self.start_text_search_dialog();
+                return Ok(());
+            }
             Action::NewFile => {
                 self.start_new_file_prompt();
                 return Ok(());
@@ -424,7 +467,7 @@ impl App {
             Action::CtrlGPrefix => {
                 self.chord = Some(Chord::CtrlG);
                 self.status =
-                    "Ctrl-G: g/d=def · t=type · l/v=line · b=back · Esc cancels".into();
+                    "Ctrl-G: g/d=def · t=type · f=find · l/v=line · b=back · Esc cancels".into();
                 return Ok(());
             }
             Action::ToggleAutosave => {
@@ -443,6 +486,8 @@ impl App {
                     self.open_file = None;
                 } else if self.type_search.is_some() {
                     self.type_search = None;
+                } else if self.text_search.is_some() {
+                    self.text_search = None;
                 } else if self.history.is_some() {
                     self.history = None;
                 } else if self.diff.is_some() {
@@ -469,6 +514,10 @@ impl App {
             }
             _ if self.type_search.is_some() => {
                 self.drive_type_search(action)?;
+                return Ok(());
+            }
+            _ if self.text_search.is_some() => {
+                self.drive_text_search(action)?;
                 return Ok(());
             }
             _ if self.history.is_some() => {
@@ -576,6 +625,7 @@ impl App {
             | Action::ToggleKeysHelp
             | Action::OpenFile
             | Action::OpenTypeSearch
+            | Action::OpenTextSearch
             | Action::NewFile
             | Action::GoToLine
             | Action::CtrlGPrefix
@@ -954,6 +1004,139 @@ impl App {
         }
     }
 
+    /// Ctrl-G f — pop up the project-wide text-search dialog rooted
+    /// at `tree.root`. The dialog walks files lazily on each query
+    /// (kept short by the 2-char minimum + result cap) rather than
+    /// pre-indexing, so opening it is instant even on large trees.
+    fn start_text_search_dialog(&mut self) {
+        if self.text_search.is_some() {
+            return;
+        }
+        self.text_search = Some(TextSearchView {
+            root: self.tree.root.clone(),
+            query: String::new(),
+            results: Vec::new(),
+            cursor: 0,
+            top: 0,
+            status: "Type at least 2 characters".into(),
+        });
+    }
+
+    /// Route a key into the text-search dialog. Letters/Backspace
+    /// re-walk the tree, arrows navigate matches, Enter opens the
+    /// selected file at the matching line/column, Esc cancels.
+    fn drive_text_search(&mut self, action: Action) -> Result<()> {
+        let Some(view) = self.text_search.as_mut() else {
+            return Ok(());
+        };
+        let mut refilter = false;
+        match action {
+            Action::Insert('\n') => {
+                let hit = view.results.get(view.cursor).cloned();
+                self.text_search = None;
+                if let Some(hit) = hit {
+                    self.jump_to_text_hit(hit);
+                }
+                return Ok(());
+            }
+            Action::Insert(c) if !c.is_control() => {
+                view.query.push(c);
+                refilter = true;
+            }
+            Action::DeletePrev => {
+                if view.query.pop().is_some() {
+                    refilter = true;
+                }
+            }
+            Action::MoveUp => {
+                if view.cursor > 0 {
+                    view.cursor -= 1;
+                }
+            }
+            Action::MoveDown => {
+                if view.cursor + 1 < view.results.len() {
+                    view.cursor += 1;
+                }
+            }
+            Action::MoveHome => view.cursor = 0,
+            Action::MoveEnd => {
+                if !view.results.is_empty() {
+                    view.cursor = view.results.len() - 1;
+                }
+            }
+            _ => {}
+        }
+        if refilter {
+            self.refresh_text_search_results();
+        }
+        Ok(())
+    }
+
+    /// Re-walk the tree under the dialog's `root` and store hits for
+    /// the current query. Skips the walk for queries under 2 chars
+    /// (matches the type-search idiom — single letters would just
+    /// return everything).
+    fn refresh_text_search_results(&mut self) {
+        let Some(view) = self.text_search.as_mut() else {
+            return;
+        };
+        view.cursor = 0;
+        view.top = 0;
+        if view.query.chars().count() < 2 {
+            view.results.clear();
+            view.status = "Type at least 2 characters".into();
+            return;
+        }
+        let root = view.root.clone();
+        let query = view.query.clone();
+        let (hits, hit_capped) = grep_under_root(&root, &query);
+        let v = self.text_search.as_mut().expect("set above");
+        v.results = hits;
+        v.status = if v.results.is_empty() {
+            format!("No matches for \"{}\"", query)
+        } else if hit_capped {
+            format!(
+                "{} match(es) — capped at {}",
+                v.results.len(),
+                TEXT_SEARCH_MAX_HITS
+            )
+        } else {
+            String::new()
+        };
+    }
+
+    /// Open the file backing a text-search hit and place the cursor
+    /// on the matching column. Mirrors `jump_to_type_hit` — same
+    /// dirty-buffer guard, same nav-stack push, same rollback.
+    fn jump_to_text_hit(&mut self, hit: TextHit) {
+        let target = hit.path.clone();
+        let absolute = if target.is_absolute() {
+            target
+        } else {
+            self.tree.root.join(target)
+        };
+        if self.buffer.path() == Some(absolute.as_path()) {
+            self.view.goto(&self.buffer, hit.line, hit.col);
+            self.status = String::new();
+            return;
+        }
+        if self.buffer.is_dirty() {
+            self.status = "Save first — current buffer has unsaved changes".into();
+            return;
+        }
+        self.push_nav_stack();
+        match self.open_file(&absolute) {
+            Ok(()) => {
+                self.view.goto(&self.buffer, hit.line, hit.col);
+                self.status = String::new();
+            }
+            Err(e) => {
+                self.nav_stack.pop();
+                self.status = format!("Could not open {}: {e}", absolute.display());
+            }
+        }
+    }
+
     /// Navigate to the location of a type-search hit. Mirrors the
     /// cross-file branch of `go_to_definition` — same dirty-buffer
     /// guard, same nav-stack push, same rollback on open failure.
@@ -1080,6 +1263,10 @@ impl App {
                 Action::CtrlGPrefix => Some(Action::GoToDefinition),
                 Action::Insert('g' | 'G' | 'd' | 'D') => Some(Action::GoToDefinition),
                 Action::Insert('t' | 'T') => Some(Action::OpenTypeSearch),
+                // "f" for find: project-wide text search dialog rooted
+                // at the tree's project root. "s" reads as "search" but
+                // is also accepted for muscle-memory.
+                Action::Insert('f' | 'F' | 's' | 'S') => Some(Action::OpenTextSearch),
                 Action::Insert('l' | 'L' | 'v' | 'V') => Some(Action::GoToLine),
                 Action::Insert('b' | 'B') => Some(Action::GoBack),
                 _ => None,
@@ -1828,6 +2015,135 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Per-query upper bound on text-search results. A 2-char query
+/// against a vendored monorepo could hit hundreds of thousands of
+/// lines; we cap so the dialog stays usable and the walk returns in
+/// bounded time.
+pub const TEXT_SEARCH_MAX_HITS: usize = 500;
+/// Per-file byte cap. Files bigger than this are skipped entirely —
+/// they're usually generated, vendored, or binary, and not what the
+/// user is grepping for. Matches the spirit of `walk_files` skipping
+/// `target/` and `node_modules/`.
+const TEXT_SEARCH_MAX_FILE_BYTES: u64 = 1_000_000;
+/// Width budget for the line preview shown in each match row. Long
+/// lines truncate so each result still fits on a single row.
+const TEXT_SEARCH_PREVIEW_CHARS: usize = 200;
+
+/// Walk `root` recursively (same skip-list as `walk_files`) and
+/// collect case-insensitive substring matches of `query`, one entry
+/// per matching line. Returns `(hits, capped)`; `capped` is `true`
+/// when we hit `TEXT_SEARCH_MAX_HITS` and stopped scanning.
+fn grep_under_root(root: &Path, query: &str) -> (Vec<TextHit>, bool) {
+    let mut hits: Vec<TextHit> = Vec::new();
+    if query.is_empty() {
+        return (hits, false);
+    }
+    let needle = query.to_lowercase();
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    let mut capped = false;
+    'walk: while let Some(dir) = stack.pop() {
+        let Ok(reader) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for ent in reader.filter_map(|r| r.ok()) {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            if matches!(
+                name.as_str(),
+                "target" | "node_modules" | "dist" | "build" | "vendor" | "venv" | "__pycache__"
+            ) {
+                continue;
+            }
+            let p = ent.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            // Cheap skip: stat once, drop oversized / unstattable
+            // entries before opening them.
+            let meta = match ent.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !meta.is_file() || meta.len() > TEXT_SEARCH_MAX_FILE_BYTES {
+                continue;
+            }
+            let rel = p
+                .strip_prefix(root)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|_| p.clone());
+            let Ok(contents) = std::fs::read_to_string(&p) else {
+                // Non-UTF-8: skip silently rather than surface a per-file
+                // error in the dialog.
+                continue;
+            };
+            for (line_idx, line) in contents.lines().enumerate() {
+                let Some(byte_pos) = find_ignore_ascii_case(line, &needle) else {
+                    continue;
+                };
+                let col = line[..byte_pos].chars().count();
+                hits.push(TextHit {
+                    path: rel.clone(),
+                    line: line_idx,
+                    col,
+                    preview: preview_line(line),
+                });
+                if hits.len() >= TEXT_SEARCH_MAX_HITS {
+                    capped = true;
+                    break 'walk;
+                }
+            }
+        }
+    }
+    // File-then-line is the order users expect in a grep result list.
+    hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    (hits, capped)
+}
+
+/// Case-insensitive substring search returning the byte offset of
+/// the first occurrence. `needle` is assumed already lowercased so
+/// we don't re-allocate it per line. ASCII-folded only — full Unicode
+/// case folding can wait until users start grepping non-ASCII source.
+fn find_ignore_ascii_case(haystack: &str, lowercase_needle: &str) -> Option<usize> {
+    if lowercase_needle.is_empty() {
+        return Some(0);
+    }
+    let n = lowercase_needle.len();
+    if haystack.len() < n {
+        return None;
+    }
+    let needle_bytes = lowercase_needle.as_bytes();
+    let bytes = haystack.as_bytes();
+    let last = bytes.len() - n;
+    for i in 0..=last {
+        let mut matched = true;
+        for j in 0..n {
+            if bytes[i + j].eq_ignore_ascii_case(&needle_bytes[j]) {
+                continue;
+            }
+            matched = false;
+            break;
+        }
+        if matched && haystack.is_char_boundary(i) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Trim leading whitespace and cap the line length so each match
+/// renders on a single row. Trailing whitespace is also trimmed.
+fn preview_line(line: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed.chars().count() > TEXT_SEARCH_PREVIEW_CHARS {
+        trimmed.chars().take(TEXT_SEARCH_PREVIEW_CHARS).collect()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Substring match (case-insensitive) against the full relative
 /// path. Score = position of the first match (earlier = better);
 /// stable-sort by score, so an empty query keeps the source order
@@ -2048,6 +2364,7 @@ fn action_intent(action: &Action) -> Option<String> {
         | Action::ToggleKeysHelp
         | Action::OpenFile
         | Action::OpenTypeSearch
+        | Action::OpenTextSearch
         | Action::NewFile
         | Action::ToggleAutosave
         | Action::ShowType
@@ -2160,5 +2477,88 @@ fn foo(
         let mut b = Buffer::scratch();
         b.insert_str(0, text);
         b
+    }
+
+    #[test]
+    fn find_ignore_ascii_case_matches_mixed_case() {
+        assert_eq!(find_ignore_ascii_case("Hello World", "world"), Some(6));
+        assert_eq!(find_ignore_ascii_case("HELLO world", "hello"), Some(0));
+        assert_eq!(find_ignore_ascii_case("nope", "yes"), None);
+    }
+
+    #[test]
+    fn preview_line_trims_and_caps() {
+        assert_eq!(preview_line("    let x = 1;   "), "let x = 1;");
+        let long: String = "a".repeat(TEXT_SEARCH_PREVIEW_CHARS + 50);
+        let prev = preview_line(&long);
+        assert_eq!(prev.chars().count(), TEXT_SEARCH_PREVIEW_CHARS);
+    }
+
+    /// Make a fresh test root under `std::env::temp_dir()` and return
+    /// its path. The label keeps collisions from concurrent tests
+    /// readable; PID + nanos make it actually unique.
+    fn fresh_test_root(label: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "dyad-grep-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn grep_under_root_finds_hits_and_orders_by_path() {
+        let root = fresh_test_root("hits");
+        std::fs::write(root.join("a.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("b.rs"), "// alpha lives here\nfn other() {}\n")
+            .unwrap();
+        // Should be skipped: hidden dir, vendored dir, hidden file.
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git").join("HEAD"), "alpha").unwrap();
+        std::fs::create_dir(root.join("target")).unwrap();
+        std::fs::write(root.join("target").join("junk.rs"), "fn alpha() {}").unwrap();
+        std::fs::write(root.join(".secret"), "alpha").unwrap();
+
+        let (hits, capped) = grep_under_root(&root, "alpha");
+        assert!(!capped);
+        // file-then-line ordering, no skipped-dir entries.
+        let paths: Vec<PathBuf> = hits.iter().map(|h| h.path.clone()).collect();
+        assert_eq!(paths, vec![PathBuf::from("a.rs"), PathBuf::from("sub").join("b.rs")]);
+        assert_eq!(hits[0].line, 0);
+        assert_eq!(hits[0].col, 3);
+        assert!(hits[0].preview.contains("alpha"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn grep_under_root_is_case_insensitive() {
+        let root = fresh_test_root("case");
+        std::fs::write(root.join("a.rs"), "Hello World\n").unwrap();
+        let (hits, _) = grep_under_root(&root, "WORLD");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].col, 6);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn grep_under_root_skips_files_over_size_cap() {
+        let root = fresh_test_root("size");
+        let mut big = String::with_capacity(TEXT_SEARCH_MAX_FILE_BYTES as usize + 100);
+        big.push_str("needle\n");
+        big.push_str(&"x".repeat(TEXT_SEARCH_MAX_FILE_BYTES as usize + 50));
+        std::fs::write(root.join("big.bin"), big).unwrap();
+        std::fs::write(root.join("small.txt"), "needle here\n").unwrap();
+        let (hits, _) = grep_under_root(&root, "needle");
+        let paths: Vec<PathBuf> = hits.iter().map(|h| h.path.clone()).collect();
+        assert_eq!(paths, vec![PathBuf::from("small.txt")]);
+        std::fs::remove_dir_all(&root).ok();
     }
 }

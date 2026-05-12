@@ -29,6 +29,7 @@ pub enum Action {
     ToggleKeysHelp,
     OpenFile,
     OpenTypeSearch,
+    OpenTextSearch,
     NewFile,
     ToggleAutosave,
     Escape,
