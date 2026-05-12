@@ -25,9 +25,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -104,11 +104,22 @@ struct LspState {
     /// Only servers whose `Language::supports_quiescent_status()` is
     /// true ever flip this; for the rest `is_indexing()` short-circuits.
     quiescent: bool,
+    /// Most recent `did_open`/`did_change` time per URI. Paired with
+    /// `last_diagnostics_at` to power `wait_until_idle`: an LSP catches
+    /// up when its last publishDiagnostics is at least as new as the
+    /// last sync we sent it.
+    last_did_change_at: HashMap<String, Instant>,
+    /// Most recent `publishDiagnostics` time per URI.
+    last_diagnostics_at: HashMap<String, Instant>,
 }
 
 pub struct LspClient {
     language: Language,
     state: Arc<Mutex<LspState>>,
+    /// Notified whenever the reader thread updates `LspState` —
+    /// publishDiagnostics, quiescent flag flip, metals status change.
+    /// Lets `wait_until_idle` block on real events instead of polling.
+    state_cv: Arc<Condvar>,
     next_id: AtomicI64,
     /// Shared with the reader thread so server-initiated requests
     /// (`workspace/configuration`, `client/registerCapability`, …) can
@@ -160,14 +171,21 @@ impl LspClient {
             pending: HashMap::new(),
             diagnostics: HashMap::new(),
             quiescent: false,
+            last_did_change_at: HashMap::new(),
+            last_diagnostics_at: HashMap::new(),
         }));
+        let state_cv = Arc::new(Condvar::new());
         let stdin = Arc::new(Mutex::new(stdin));
         let reader_state = Arc::clone(&state);
+        let reader_cv = Arc::clone(&state_cv);
         let reader_stdin = Arc::clone(&stdin);
-        let reader = std::thread::spawn(move || reader_loop(stdout, reader_state, reader_stdin));
+        let reader = std::thread::spawn(move || {
+            reader_loop(stdout, reader_state, reader_cv, reader_stdin)
+        });
         let client = Self {
             language,
             state,
+            state_cv,
             next_id: AtomicI64::new(1),
             stdin,
             child: Mutex::new(child),
@@ -220,6 +238,7 @@ impl LspClient {
     }
 
     pub fn did_open(&self, uri: &str, language_id: &str, text: &str) -> Result<()> {
+        self.stamp_sync(uri);
         self.notify(
             "textDocument/didOpen",
             json!({
@@ -237,6 +256,7 @@ impl LspClient {
         // Full-document sync — simpler than computing deltas and good
         // enough for one-file workflows. Incremental sync is a worthwhile
         // follow-up if perf becomes a concern.
+        self.stamp_sync(uri);
         self.notify(
             "textDocument/didChange",
             json!({
@@ -244,6 +264,14 @@ impl LspClient {
                 "contentChanges": [{ "text": text }],
             }),
         )
+    }
+
+    fn stamp_sync(&self, uri: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .last_did_change_at
+            .insert(uri.to_string(), Instant::now());
     }
 
     pub fn did_close(&self, uri: &str) -> Result<()> {
@@ -401,6 +429,57 @@ impl LspClient {
             .unwrap_or_default()
     }
 
+    /// Block until the server has published diagnostics for the most
+    /// recent `did_open`/`did_change` of `uri` and (for languages that
+    /// expose an indexing-status notification) is no longer indexing.
+    /// Returns `true` if both conditions held before `timeout`, `false`
+    /// if the timeout fired first. Either way, current cached
+    /// diagnostics for the URI remain available via `diagnostics`.
+    ///
+    /// The "caught up" check uses wall-clock `Instant`s rather than the
+    /// LSP `version` field because `publishDiagnostics` `version` is
+    /// optional in the spec and not all servers populate it.
+    pub fn wait_until_idle(&self, uri: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let tracks_indexing = self.language.tracks_indexing_status();
+        let mut guard = self.state.lock().unwrap();
+        loop {
+            let synced_at = guard.last_did_change_at.get(uri).copied();
+            let diags_at = guard.last_diagnostics_at.get(uri).copied();
+            // "Diagnostics fresher than the last sync." If we never
+            // sent any sync (URI unknown to us) treat as caught up.
+            let diagnostics_caught_up = match (synced_at, diags_at) {
+                (Some(s), Some(d)) => d >= s,
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
+            let indexing_idle = !tracks_indexing || guard.quiescent;
+            if diagnostics_caught_up && indexing_idle {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (g, res) = self.state_cv.wait_timeout(guard, deadline - now).unwrap();
+            guard = g;
+            if res.timed_out() {
+                // Re-check conditions one more time before returning;
+                // the predicate may have flipped between the wait and
+                // the timeout firing.
+                let synced_at = guard.last_did_change_at.get(uri).copied();
+                let diags_at = guard.last_diagnostics_at.get(uri).copied();
+                let diagnostics_caught_up = match (synced_at, diags_at) {
+                    (Some(s), Some(d)) => d >= s,
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                };
+                let indexing_idle = !tracks_indexing || guard.quiescent;
+                return diagnostics_caught_up && indexing_idle;
+            }
+        }
+    }
+
     // ---------- Wire layer ----------
 
     fn request(
@@ -471,6 +550,7 @@ impl Drop for LspClient {
 fn reader_loop(
     stdout: ChildStdout,
     state: Arc<Mutex<LspState>>,
+    state_cv: Arc<Condvar>,
     stdin: Arc<Mutex<ChildStdin>>,
 ) {
     let mut reader = BufReader::new(stdout);
@@ -524,18 +604,21 @@ fn reader_loop(
                 "textDocument/publishDiagnostics" => {
                     if let Some(params) = msg.get("params") {
                         update_diagnostics(&state, params);
+                        state_cv.notify_all();
                     }
                 }
                 "experimental/serverStatus" => {
                     // rust-analyzer extension.
                     if let Some(params) = msg.get("params") {
                         update_quiescent(&state, params);
+                        state_cv.notify_all();
                     }
                 }
                 "metals/status" => {
                     // Metals extension — same idea, different schema.
                     if let Some(params) = msg.get("params") {
                         update_metals_status(&state, params);
+                        state_cv.notify_all();
                     }
                 }
                 _ => {}
@@ -559,11 +642,10 @@ fn update_diagnostics(state: &Arc<Mutex<LspState>>, params: &Value) {
         .get("diagnostics")
         .and_then(|v| serde_json::from_value::<Vec<Diagnostic>>(v.clone()).ok())
         .unwrap_or_default();
-    state
-        .lock()
-        .unwrap()
-        .diagnostics
-        .insert(uri.to_string(), diags);
+    let mut s = state.lock().unwrap();
+    s.diagnostics.insert(uri.to_string(), diags);
+    s.last_diagnostics_at
+        .insert(uri.to_string(), Instant::now());
 }
 
 /// Handle a rust-analyzer `experimental/serverStatus` notification.
@@ -790,6 +872,8 @@ mod tests {
             pending: HashMap::new(),
             diagnostics: HashMap::new(),
             quiescent: false,
+            last_did_change_at: HashMap::new(),
+            last_diagnostics_at: HashMap::new(),
         }));
         let params = json!({
             "uri": "file:///tmp/x.rs",

@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -124,6 +125,46 @@ pub struct ClientInfo {
     /// "agent" for an MCP session, "human" once a TUI client lands.
     pub kind: String,
     pub focus: Option<u64>,
+}
+
+/// Outcome of `diag.wait_until_idle`. `caught_up` is `false` when the
+/// wait timed out before the server published a fresh diagnostics frame
+/// (or — for languages that report it — finished indexing); the
+/// `diagnostics` payload is still the most recent the server gave us.
+#[derive(Clone, Debug, Serialize)]
+pub struct DiagWaitResult {
+    pub caught_up: bool,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// One occurrence of an inline agent-task marker (`// CLAUDE: ...` or
+/// `// TODO(claude): ...`) discovered by `tasks.list`. The path is
+/// relative to the scan root so it can be rendered without leaking
+/// absolute filesystem prefixes.
+#[derive(Clone, Debug, Serialize)]
+pub struct InlineTask {
+    pub path: String,
+    pub line: usize,
+    pub kind: String,
+    pub text: String,
+}
+
+/// Per-proposal failure surfaced by `proposals.accept_all`. The
+/// proposal is re-queued under a fresh id (the same way a single
+/// `proposal_accept` re-queues), so the agent can `proposals.list` to
+/// find it.
+#[derive(Clone, Debug, Serialize)]
+pub struct BulkAcceptError {
+    pub proposal_id: ProposalId,
+    pub message: String,
+}
+
+/// Outcome of `proposals.accept_all`. `accepted` is the count that
+/// landed cleanly; `errors` lists the ones that didn't.
+#[derive(Clone, Debug, Serialize)]
+pub struct BulkAcceptResult {
+    pub accepted: usize,
+    pub errors: Vec<BulkAcceptError>,
 }
 
 impl ProtocolState {
@@ -456,6 +497,30 @@ impl ProtocolState {
         Ok(lsp.diagnostics(uri))
     }
 
+    /// Block until the LSP serving `buffer_id` has acknowledged the most
+    /// recent sync for the buffer's URI with a `publishDiagnostics`, and
+    /// (for languages that report indexing status) is no longer
+    /// indexing. Returns `(caught_up, diagnostics)` — `caught_up` is
+    /// `false` if the timeout fired first, in which case the cached
+    /// diagnostics may still be stale.
+    ///
+    /// This is the edit-then-verify primitive: after an `edit.*` call,
+    /// agents that want to know "did my edit introduce errors?" can
+    /// call this instead of polling `diag.current` in a loop.
+    pub fn diag_wait_until_idle(
+        &self,
+        buffer_id: u64,
+        timeout: Duration,
+    ) -> Result<DiagWaitResult> {
+        let (lsp, uri) = self.lsp_for_buffer(buffer_id)?;
+        let caught_up = lsp.wait_until_idle(uri, timeout);
+        let diagnostics = lsp.diagnostics(uri);
+        Ok(DiagWaitResult {
+            caught_up,
+            diagnostics,
+        })
+    }
+
     /// Phase 7/8 tier-3 edit: ask rust-analyzer for the workspace edits
     /// required to rename the symbol at `(line, character)` to
     /// `new_name`, then apply the changes to every loaded buffer the
@@ -633,6 +698,41 @@ impl ProtocolState {
         Ok(())
     }
 
+    /// Accept every queued proposal in id order. Each accept goes
+    /// through the same tx machinery as a single `proposal_accept`, so
+    /// per-proposal failures (typically version mismatches) re-queue
+    /// the offender and continue. Returns the number of successful
+    /// accepts plus the list of `(id, error)` for any that failed —
+    /// useful for "OK everything Claude proposed, tell me what didn't
+    /// fit" review flows.
+    pub fn proposals_accept_all(&mut self) -> BulkAcceptResult {
+        let ids: Vec<ProposalId> = self.proposals.list().into_iter().map(|p| p.id).collect();
+        let mut accepted = 0;
+        let mut errors = Vec::new();
+        for id in ids {
+            match self.proposal_accept(id) {
+                Ok(_) => accepted += 1,
+                Err(e) => errors.push(BulkAcceptError {
+                    proposal_id: id,
+                    message: e.to_string(),
+                }),
+            }
+        }
+        BulkAcceptResult { accepted, errors }
+    }
+
+    /// Discard every queued proposal. Returns the number dropped.
+    pub fn proposals_reject_all(&mut self) -> usize {
+        let ids: Vec<ProposalId> = self.proposals.list().into_iter().map(|p| p.id).collect();
+        let mut rejected = 0;
+        for id in ids {
+            if self.proposal_reject(id).is_ok() {
+                rejected += 1;
+            }
+        }
+        rejected
+    }
+
     /// Number of proposals currently in the queue. Cheap status check
     /// for agents that don't want to pay the cost of a full
     /// `proposals.list` just to know whether anything is pending.
@@ -699,6 +799,38 @@ impl ProtocolState {
     pub fn git_commit(&self, buffer_id: u64, message: &str) -> Result<String> {
         let repo_root = self.repo_root_for_buffer(buffer_id)?;
         git::commit(&repo_root, message)
+    }
+
+    // ---------- Inline agent tasks ----------
+
+    /// Walk the workspace beneath `buffer_id` for inline agent task
+    /// markers (`// CLAUDE: ...`, `// TODO(claude): ...`, also `# ...`
+    /// for hash-comment languages — the match is on the keyword, not
+    /// the comment prefix). Lets agents drop intent into the file where
+    /// it belongs and pick it up on the next pass without copy-paste.
+    ///
+    /// Scan root: the git repo containing the buffer if one exists,
+    /// otherwise the buffer's parent directory. Result paths are
+    /// relative to that root.
+    pub fn tasks_list(&self, buffer_id: u64) -> Result<Vec<InlineTask>> {
+        let root = self.tasks_scan_root_for_buffer(buffer_id)?;
+        Ok(scan_inline_tasks(&root))
+    }
+
+    fn tasks_scan_root_for_buffer(&self, buffer_id: u64) -> Result<PathBuf> {
+        let entry = self.buffer_entry(buffer_id)?;
+        let path = entry
+            .buffer
+            .path()
+            .context("buffer has no path; cannot locate a scan root")?;
+        if let Ok(repo) = git::repo_root_for(path) {
+            return Ok(repo);
+        }
+        let parent = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Ok(parent)
     }
 
     fn repo_root_for_buffer(&self, buffer_id: u64) -> Result<PathBuf> {
@@ -915,6 +1047,99 @@ pub(crate) fn apply_text_edits(buffer: &mut Buffer, edits: &[TextEdit]) -> Resul
         }
     }
     Ok(())
+}
+
+/// Per-scan upper bound on inline-task hits. A repo with thousands of
+/// vendored TODOs shouldn't be able to balloon a single MCP response —
+/// agents that need more granularity can scan a subdirectory.
+const TASKS_MAX_HITS: usize = 1000;
+/// Per-file byte cap. Files bigger than this are skipped; they're
+/// usually generated or vendored and not where inline agent intent
+/// lives. Matches the spirit of the TUI's text-search cap.
+const TASKS_MAX_FILE_BYTES: u64 = 1_000_000;
+
+/// Walk `root` recursively (skipping dotfiles and the usual vendored /
+/// build directories) and collect lines that contain either `CLAUDE:`
+/// or `TODO(claude)` (case-insensitive on the keyword). Results are
+/// sorted by path, then line. Capped at `TASKS_MAX_HITS`.
+pub(crate) fn scan_inline_tasks(root: &Path) -> Vec<InlineTask> {
+    let mut hits: Vec<InlineTask> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    'walk: while let Some(dir) = stack.pop() {
+        let Ok(reader) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for ent in reader.filter_map(|r| r.ok()) {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            if matches!(
+                name.as_str(),
+                "target" | "node_modules" | "dist" | "build" | "vendor" | "venv" | "__pycache__"
+            ) {
+                continue;
+            }
+            let p = ent.path();
+            let meta = match ent.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if !meta.is_file() || meta.len() > TASKS_MAX_FILE_BYTES {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            let rel = p
+                .strip_prefix(root)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|_| p.clone());
+            for (idx, line) in contents.lines().enumerate() {
+                let Some(parsed) = parse_inline_task(line) else {
+                    continue;
+                };
+                hits.push(InlineTask {
+                    path: rel.display().to_string(),
+                    line: idx,
+                    kind: parsed.0,
+                    text: parsed.1,
+                });
+                if hits.len() >= TASKS_MAX_HITS {
+                    break 'walk;
+                }
+            }
+        }
+    }
+    hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    hits
+}
+
+/// Look for `CLAUDE:` or `TODO(claude)` in a single line. Returns
+/// `(kind, body)` on match — `kind` is `"claude"` or `"todo"`; body is
+/// the trimmed text after the marker. `TODO(claude)` wins over a bare
+/// `CLAUDE:` on the same line so the more specific shape gets the
+/// `todo` tag.
+fn parse_inline_task(line: &str) -> Option<(String, String)> {
+    let lower = line.to_ascii_lowercase();
+    if let Some(start) = lower.find("todo(claude)") {
+        let after = &line[start + "todo(claude)".len()..];
+        let body = after
+            .trim_start_matches(|c: char| c == ':' || c.is_whitespace())
+            .trim()
+            .to_string();
+        return Some(("todo".to_string(), body));
+    }
+    if let Some(start) = lower.find("claude:") {
+        let after = &line[start + "claude:".len()..];
+        let body = after.trim().to_string();
+        return Some(("claude".to_string(), body));
+    }
+    None
 }
 
 /// Convert an LSP `(line, character)` position into a rope char index.
@@ -1270,6 +1495,156 @@ mod tests {
         let still_queued = state.proposals_list();
         assert_eq!(still_queued.len(), 1);
         assert_ne!(still_queued[0].id, id);
+    }
+
+    #[test]
+    fn diag_wait_until_idle_errors_for_buffer_without_lsp() {
+        // The scratch state opens a .rs path that never went through
+        // rust-analyzer (no binary on test PATH most of the time), so
+        // there's no client to wait on. The protocol method should
+        // surface that as an error instead of hanging.
+        let path = std::env::temp_dir()
+            .join(format!("dyad_diag_wait_{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let state = ProtocolState::open(path).unwrap();
+        let err = state
+            .diag_wait_until_idle(SOLE_BUFFER_ID, Duration::from_millis(50))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("recognized language")
+                || msg.contains("not running")
+                || msg.contains("no recognized"),
+            "unexpected error: {msg}",
+        );
+    }
+
+    #[test]
+    fn parse_inline_task_recognizes_todo_and_claude_markers() {
+        assert_eq!(
+            parse_inline_task("// CLAUDE: rename this to Foo"),
+            Some(("claude".into(), "rename this to Foo".into())),
+        );
+        assert_eq!(
+            parse_inline_task("# claude: drop the prefix"),
+            Some(("claude".into(), "drop the prefix".into())),
+        );
+        assert_eq!(
+            parse_inline_task("// TODO(claude): refactor"),
+            Some(("todo".into(), "refactor".into())),
+        );
+        assert_eq!(
+            parse_inline_task("/* todo(Claude) plain body */"),
+            Some(("todo".into(), "plain body */".into())),
+        );
+        assert_eq!(parse_inline_task("nothing here"), None);
+        // `TODO(claude)` wins over a coincidental `claude:` later in the line.
+        assert_eq!(
+            parse_inline_task("// TODO(claude): mention claude: in body"),
+            Some(("todo".into(), "mention claude: in body".into())),
+        );
+    }
+
+    #[test]
+    fn scan_inline_tasks_finds_markers_recursively_and_sorts_results() {
+        let root = std::env::temp_dir().join(format!(
+            "dyad_inline_tasks_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(
+            root.join("a.rs"),
+            "fn a() {}\n// CLAUDE: rename a -> b\nfn b() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("nested/b.rs"),
+            "// TODO(claude): refactor this\nfn x() {}\n",
+        )
+        .unwrap();
+        // Should be skipped (dotfile + ignored dir).
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("target/skipme.rs"), "// CLAUDE: ignored").unwrap();
+        std::fs::write(root.join(".hidden"), "// CLAUDE: also ignored").unwrap();
+
+        let hits = scan_inline_tasks(&root);
+        let labels: Vec<(String, usize, String)> = hits
+            .into_iter()
+            .map(|h| (h.path, h.line, h.kind))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                ("a.rs".to_string(), 1, "claude".to_string()),
+                ("nested/b.rs".to_string(), 0, "todo".to_string()),
+            ]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn proposals_accept_all_drains_queue_and_applies_in_id_order() {
+        let mut state = scratch_state("accept_all");
+        // Two proposals, both valid against the current version.
+        let v0 = state.buffer_version(SOLE_BUFFER_ID).unwrap();
+        let _p1 = state
+            .propose_replace_range(
+                SOLE_BUFFER_ID,
+                v0,
+                CharRange { start: 0, end: 0 },
+                "// first\n".into(),
+                "first".into(),
+            )
+            .unwrap();
+        // p2 targets a version we don't yet have — accept_all should
+        // re-queue this one and keep going with the rest.
+        let _p2 = state
+            .propose_replace_range(
+                SOLE_BUFFER_ID,
+                v0 + 999,
+                CharRange { start: 0, end: 0 },
+                "// second\n".into(),
+                "second".into(),
+            )
+            .unwrap();
+
+        let result = state.proposals_accept_all();
+        // p1 lands; p2 fails with a version error and is re-queued.
+        assert_eq!(result.accepted, 1);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].message.contains("version mismatch"));
+        let remaining = state.proposals_list();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].intent, "second");
+        assert!(text_of(&state, SOLE_BUFFER_ID).starts_with("// first\n"));
+    }
+
+    #[test]
+    fn proposals_reject_all_drains_queue_without_applying() {
+        let mut state = scratch_state("reject_all");
+        let pre = text_of(&state, SOLE_BUFFER_ID);
+        let v = state.buffer_version(SOLE_BUFFER_ID).unwrap();
+        for i in 0..3 {
+            state
+                .propose_replace_range(
+                    SOLE_BUFFER_ID,
+                    v,
+                    CharRange { start: 0, end: 0 },
+                    format!("// {i}\n"),
+                    format!("noise {i}"),
+                )
+                .unwrap();
+        }
+        assert_eq!(state.proposals_count(), 3);
+        let dropped = state.proposals_reject_all();
+        assert_eq!(dropped, 3);
+        assert_eq!(state.proposals_count(), 0);
+        assert_eq!(text_of(&state, SOLE_BUFFER_ID), pre);
     }
 
     #[test]

@@ -139,8 +139,12 @@ fn initialize_returns_server_info_and_tools_list() {
         "proposals.accept",
         "proposals.reject",
         "proposals.count",
+        "proposals.accept_all",
+        "proposals.reject_all",
         "symbol.references",
         "symbol.hover",
+        "diag.wait_until_idle",
+        "tasks.list",
     ] {
         assert!(names.contains(&required), "missing tool {required}");
     }
@@ -407,6 +411,108 @@ fn multi_buffer_open_and_list_assigns_ascending_ids() {
     assert_eq!(ids, vec![1, 2]);
 
     let _ = std::fs::remove_file(&second);
+}
+
+#[test]
+fn proposals_accept_all_drains_queue_via_jsonrpc() {
+    let mut s = McpSession::start("fn hello() {}\n", "accept_all");
+    let _ = s.call(1, "initialize", json!({}));
+
+    let v0 = tool_payload(&s.call_tool(2, "buffer.read", json!({ "buffer_id": 1 })))
+        ["version"]
+        .as_u64()
+        .unwrap();
+
+    // Two proposals queued against the same version. The second
+    // commits first via accept_all (id order), then the first becomes
+    // a stale-version retry. Use a benign target to keep both valid:
+    // both insert at position 0.
+    for i in 0..2 {
+        let _ = s.call_tool(
+            3 + i,
+            "edit.propose_range",
+            json!({
+                "buffer_id": 1,
+                "version": v0,
+                "range": { "start": 0, "end": 0 },
+                "text": format!("// p{i}\n"),
+                "intent": format!("p{i}"),
+            }),
+        );
+    }
+    let count = tool_payload(&s.call_tool(10, "proposals.count", json!({})));
+    assert_eq!(count["count"], 2);
+
+    let result = tool_payload(&s.call_tool(11, "proposals.accept_all", json!({})));
+    // p1 lands cleanly; p2 was authored against v0 but the buffer has
+    // moved on, so it re-queues with a version error. accepted == 1.
+    assert_eq!(result["accepted"], 1);
+    assert_eq!(result["errors"].as_array().unwrap().len(), 1);
+
+    // One proposal remains queued (the re-queued p2).
+    let after = tool_payload(&s.call_tool(12, "proposals.count", json!({})));
+    assert_eq!(after["count"], 1);
+
+    // Drain the rest.
+    let rejected = tool_payload(&s.call_tool(13, "proposals.reject_all", json!({})));
+    assert_eq!(rejected["rejected"], 1);
+    let empty = tool_payload(&s.call_tool(14, "proposals.count", json!({})));
+    assert_eq!(empty["count"], 0);
+}
+
+#[test]
+fn tasks_list_finds_inline_claude_markers_in_workspace() {
+    // Build a tiny repo-like tree, point the MCP server at one file in
+    // it, and verify `tasks.list` walks back to the parent and reports
+    // markers across files.
+    let root = std::env::temp_dir().join(format!(
+        "dyad_tasks_it_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    std::fs::create_dir_all(root.join("nested")).unwrap();
+    let entry = root.join("entry.rs");
+    std::fs::write(&entry, "fn main() {}\n// CLAUDE: top-level\n").unwrap();
+    std::fs::write(
+        root.join("nested/other.rs"),
+        "// TODO(claude): clean this up\nfn other() {}\n",
+    )
+    .unwrap();
+
+    let mut child = Command::new(DYAD_BIN)
+        .arg("--mcp")
+        .arg(&entry)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn dyad --mcp");
+    let stdin = child.stdin.take().unwrap();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut s = McpSession {
+        child,
+        stdin,
+        stdout,
+        fixture: entry.clone(),
+    };
+    let _ = s.call(1, "initialize", json!({}));
+    let resp = s.call_tool(2, "tasks.list", json!({ "buffer_id": 1 }));
+    assert_eq!(resp["result"]["isError"], false);
+    let hits = tool_payload(&resp);
+    let arr = hits.as_array().unwrap();
+    // The entry's own file plus the nested file.
+    let kinds: Vec<&str> = arr
+        .iter()
+        .map(|h| h["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"claude"));
+    assert!(kinds.contains(&"todo"));
+
+    drop(s);
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]

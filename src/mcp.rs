@@ -207,6 +207,14 @@ fn tools_list_result() -> Value {
                     "proposal_id": {"type": "integer"},
                 },
             })),
+            tool_def("proposals.accept_all", "Accept every queued proposal in id order, each through the same tx machinery as proposals.accept. Returns {accepted, errors: [{proposal_id, message}]}; individual failures (typically version mismatches) re-queue the offending proposal under a fresh id without stopping the batch.", json!({
+                "type": "object",
+                "properties": {},
+            })),
+            tool_def("proposals.reject_all", "Discard every queued proposal. Returns {rejected} — the count dropped.", json!({
+                "type": "object",
+                "properties": {},
+            })),
             tool_def("buffer.read", "Read all or part of a buffer's text. Returns {text, version}.", json!({
                 "type": "object",
                 "required": ["buffer_id"],
@@ -342,6 +350,21 @@ fn tools_list_result() -> Value {
                 },
             })),
             tool_def("diag.current", "Return cached LSP diagnostics for a buffer (severity 1=error..4=hint). Requires a running language server (rust-analyzer for .rs, metals for .scala/.sc/.sbt).", json!({
+                "type": "object",
+                "required": ["buffer_id"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                },
+            })),
+            tool_def("diag.wait_until_idle", "Block until the LSP serving `buffer_id` has acknowledged the latest sync with a publishDiagnostics, and (for rust-analyzer / metals) is no longer indexing. Returns {caught_up, diagnostics}; caught_up=false means the timeout fired and the diagnostics may be stale. Pair with an edit.* call to do edit-then-verify without polling. `timeout_ms` defaults to 3000.", json!({
+                "type": "object",
+                "required": ["buffer_id"],
+                "properties": {
+                    "buffer_id":  {"type": "integer"},
+                    "timeout_ms": {"type": "integer", "minimum": 0},
+                },
+            })),
+            tool_def("tasks.list", "Scan the workspace beneath `buffer_id` for inline agent-task markers (`CLAUDE: ...`, `TODO(claude): ...`, case-insensitive on the keyword). Walks the buffer's git repo when present, else its parent directory. Returns [{path, line, kind, text}] sorted by path+line; `kind` is `claude` or `todo`. Lets you drop intent into comments and pick it up on the next pass without copy-paste.", json!({
                 "type": "object",
                 "required": ["buffer_id"],
                 "properties": {
@@ -523,6 +546,14 @@ fn dispatch_tool(
             state.proposal_reject(a.proposal_id)?;
             Ok(json!({}))
         }
+        "proposals.accept_all" => {
+            let result = state.proposals_accept_all();
+            Ok(json!(result))
+        }
+        "proposals.reject_all" => {
+            let rejected = state.proposals_reject_all();
+            Ok(json!({ "rejected": rejected }))
+        }
         "buffer.read" => {
             #[derive(Deserialize)]
             struct Args {
@@ -669,6 +700,31 @@ fn dispatch_tool(
             }
             let a: Args = serde_json::from_value(args)?;
             Ok(json!(state.diag_current(a.buffer_id)?))
+        }
+        "tasks.list" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            Ok(json!(state.tasks_list(a.buffer_id)?))
+        }
+        "diag.wait_until_idle" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+                #[serde(default = "default_diag_timeout_ms")]
+                timeout_ms: u64,
+            }
+            fn default_diag_timeout_ms() -> u64 {
+                3000
+            }
+            let a: Args = serde_json::from_value(args)?;
+            let result = state.diag_wait_until_idle(
+                a.buffer_id,
+                std::time::Duration::from_millis(a.timeout_ms),
+            )?;
+            Ok(json!(result))
         }
         "edit.rename_symbol" => {
             #[derive(Deserialize)]
