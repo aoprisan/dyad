@@ -17,9 +17,11 @@ Working notes for contributors (including Claude Code) are in [`CLAUDE.md`](CLAU
 
 Most of the phased build order in `DESIGN.md` is wired in: buffer/view,
 Tree-sitter, transactions + intent, MCP stdio server, `rust-analyzer` LSP,
-proposals, and the file/git/history overlays. Multi-client awareness is
-partial — multiple buffers per `ProtocolState`, no concurrent TUI+MCP session
-split yet.
+proposals (with bulk accept/reject), git plumbing, an LSP-quiesce wait for
+edit-then-verify loops (`diag.wait_until_idle`), an inline `// CLAUDE: …`
+task scanner (`tasks.list`), and the file/git/history overlays. Multi-client
+awareness is partial — multiple buffers per `ProtocolState`, no concurrent
+TUI+MCP session split yet.
 
 Tested via `cargo test` (unit + integration) and `scripts/mcp-smoke.sh` for
 the MCP protocol surface. The TUI is exercised manually.
@@ -75,6 +77,7 @@ up this same table as an overlay:
 | --------------------- | --------------------------------------------------- |
 | Ctrl-G then d/g       | Go to definition                                    |
 | Ctrl-G then t         | Find type (workspace symbol search)                 |
+| Ctrl-G then f         | Find text (project-wide text search)                |
 | Ctrl-G then l/v       | Go to line                                          |
 | Ctrl-G then b         | Back (navigation stack)                             |
 | Ctrl-O                | Back (navigation stack) — direct                    |
@@ -128,6 +131,26 @@ With `--mcp`, dyad speaks JSON-RPC 2.0 line-delimited over stdio. A smoke
 script lives at [`scripts/mcp-smoke.sh`](scripts/mcp-smoke.sh). The protocol
 verbs mirror the names in `DESIGN.md` §Edits and §Buffers & views — `Buffer`
 method names track them deliberately so the MCP layer is a thin wrapper.
+
+The current surface (`tools/list` over `--mcp`):
+
+| Tool                          | What it does                                                                           |
+| ----------------------------- | -------------------------------------------------------------------------------------- |
+| `buffer.list` / `.open` / `.close` / `.read` / `.version` | Open / close / read buffers. Reads return `{text, version}`.       |
+| `ast.query`                   | Run a tree-sitter query against the buffer's parse tree.                               |
+| `edit.replace_range`          | Replace a char range. Requires the buffer's current `version` (optimistic concurrency).|
+| `edit.replace_node`           | Replace a tree-sitter node's bytes — pair with `ast.query`.                            |
+| `edit.rename_symbol`          | LSP rename across loaded buffers; un-loaded files come back in `skipped_files`.        |
+| `tx.begin` / `.commit` / `.rollback` | Group multiple edits into one history entry with a stated intent.               |
+| `history.recent`              | Tail of flat history with each entry's intent.                                         |
+| `edit.propose_range` / `proposals.list` / `.accept` / `.reject` / `.count` | Hunk-by-hunk review queue.                |
+| `proposals.accept_all` / `.reject_all` | Bulk drain. Per-proposal failures (stale versions) re-queue without halting.  |
+| `symbol.definition` / `.references` / `.hover` / `.workspace_search` | LSP-backed navigation and search.        |
+| `diag.current`                | Cached LSP diagnostics for a buffer.                                                   |
+| `diag.wait_until_idle`        | Block until the LSP has published diagnostics for the latest sync (edit-then-verify).  |
+| `tasks.list`                  | Scan the workspace for inline `// CLAUDE: …` / `// TODO(claude): …` markers.           |
+| `git.diff` / `.status` / `.log` / `.show` / `.stage` / `.unstage` / `.commit` | Git plumbing scoped to the buffer's repo. |
+| `clients.list`                | Active clients (currently the MCP session — TUI presence is a follow-up).              |
 
 ## Architecture (one screen)
 
