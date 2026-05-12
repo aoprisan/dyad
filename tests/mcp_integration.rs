@@ -122,6 +122,7 @@ fn initialize_returns_server_info_and_tools_list() {
         .collect();
     for required in [
         "buffer.read",
+        "buffer.version",
         "edit.replace_range",
         "edit.replace_node",
         "ast.query",
@@ -137,9 +138,60 @@ fn initialize_returns_server_info_and_tools_list() {
         "proposals.list",
         "proposals.accept",
         "proposals.reject",
+        "proposals.count",
+        "symbol.references",
+        "symbol.hover",
     ] {
         assert!(names.contains(&required), "missing tool {required}");
     }
+}
+
+#[test]
+fn buffer_version_tool_returns_current_version() {
+    let mut s = McpSession::start("fn hello() {}\n", "buffer_version");
+    let _ = s.call(1, "initialize", json!({}));
+
+    // After open, version starts at 0 (Buffer::open doesn't push edits).
+    let v0 = tool_payload(&s.call_tool(2, "buffer.version", json!({ "buffer_id": 1 })));
+    assert_eq!(v0["version"], 0);
+
+    // After an edit, version advances and buffer.version reflects it.
+    let _ = s.call_tool(
+        3,
+        "edit.replace_range",
+        json!({
+            "buffer_id": 1,
+            "version": 0,
+            "range": { "start": 0, "end": 0 },
+            "text": "// ",
+        }),
+    );
+    let v1 = tool_payload(&s.call_tool(4, "buffer.version", json!({ "buffer_id": 1 })));
+    assert!(v1["version"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn proposals_count_tool_tracks_queue() {
+    let mut s = McpSession::start("fn hello() {}\n", "proposals_count");
+    let _ = s.call(1, "initialize", json!({}));
+
+    let empty = tool_payload(&s.call_tool(2, "proposals.count", json!({})));
+    assert_eq!(empty["count"], 0);
+
+    // Queue a proposal — the version is recorded, not checked here.
+    let _ = s.call_tool(
+        3,
+        "edit.propose_range",
+        json!({
+            "buffer_id": 1,
+            "version": 0,
+            "range": { "start": 0, "end": 0 },
+            "text": "// pending\n",
+            "intent": "add header",
+        }),
+    );
+    let one = tool_payload(&s.call_tool(4, "proposals.count", json!({})));
+    assert_eq!(one["count"], 1);
 }
 
 #[test]

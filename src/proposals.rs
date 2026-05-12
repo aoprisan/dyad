@@ -90,7 +90,6 @@ impl ProposalQueue {
         self.proposals.remove(&id)
     }
 
-    #[allow(dead_code)] // surfaced once a TUI status indicator wires up.
     pub fn count(&self) -> usize {
         self.proposals.len()
     }

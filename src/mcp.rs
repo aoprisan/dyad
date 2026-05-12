@@ -303,6 +303,36 @@ fn tools_list_result() -> Value {
                     "character": {"type": "integer", "minimum": 0},
                 },
             })),
+            tool_def("symbol.references", "Find all references to the symbol at (line, character) via LSP `textDocument/references`. `include_declaration` (default true) controls whether the symbol's own declaration is in the result. Requires a running language server (rust-analyzer for .rs, metals for .scala/.sc/.sbt).", json!({
+                "type": "object",
+                "required": ["buffer_id", "line", "character"],
+                "properties": {
+                    "buffer_id":           {"type": "integer"},
+                    "line":                {"type": "integer", "minimum": 0},
+                    "character":           {"type": "integer", "minimum": 0},
+                    "include_declaration": {"type": "boolean"},
+                },
+            })),
+            tool_def("symbol.hover", "Plain-text hover/signature body for the symbol at (line, character), via LSP `textDocument/hover`. Returns {text: string | null}; null means the server had nothing to report. Requires a running language server (rust-analyzer for .rs, metals for .scala/.sc/.sbt).", json!({
+                "type": "object",
+                "required": ["buffer_id", "line", "character"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                    "line":      {"type": "integer", "minimum": 0},
+                    "character": {"type": "integer", "minimum": 0},
+                },
+            })),
+            tool_def("buffer.version", "Current version of a buffer (the optimistic-concurrency token edits must reference). Cheaper than buffer.read when the agent only wants to check whether something has moved.", json!({
+                "type": "object",
+                "required": ["buffer_id"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                },
+            })),
+            tool_def("proposals.count", "Number of proposals currently in the queue. Cheap status check that avoids the cost of a full proposals.list.", json!({
+                "type": "object",
+                "properties": {},
+            })),
             tool_def("symbol.workspace_search", "Fuzzy-search workspace symbols (types, functions, etc) via LSP `workspace/symbol`. `buffer_id` picks the language server to query; the search itself is workspace-wide. Requires a running language server (rust-analyzer for .rs, metals for .scala/.sc/.sbt).", json!({
                 "type": "object",
                 "required": ["buffer_id", "query"],
@@ -582,6 +612,47 @@ fn dispatch_tool(
             let a: Args = serde_json::from_value(args)?;
             Ok(json!(state.symbol_definition(a.buffer_id, a.line, a.character)?))
         }
+        "symbol.references" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+                line: u32,
+                character: u32,
+                #[serde(default = "default_include_declaration")]
+                include_declaration: bool,
+            }
+            fn default_include_declaration() -> bool {
+                true
+            }
+            let a: Args = serde_json::from_value(args)?;
+            Ok(json!(state.symbol_references(
+                a.buffer_id,
+                a.line,
+                a.character,
+                a.include_declaration,
+            )?))
+        }
+        "symbol.hover" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+                line: u32,
+                character: u32,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            let text = state.symbol_hover(a.buffer_id, a.line, a.character)?;
+            Ok(json!({ "text": text }))
+        }
+        "buffer.version" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            let v = state.buffer_version(a.buffer_id)?;
+            Ok(json!({ "version": v }))
+        }
+        "proposals.count" => Ok(json!({ "count": state.proposals_count() })),
         "symbol.workspace_search" => {
             #[derive(Deserialize)]
             struct Args {
@@ -730,6 +801,7 @@ mod tests {
         for expected in [
             "buffer.list",
             "buffer.read",
+            "buffer.version",
             "ast.query",
             "edit.replace_range",
             "edit.replace_node",
@@ -738,6 +810,8 @@ mod tests {
             "tx.rollback",
             "history.recent",
             "symbol.definition",
+            "symbol.references",
+            "symbol.hover",
             "symbol.workspace_search",
             "diag.current",
             "edit.rename_symbol",
@@ -755,6 +829,7 @@ mod tests {
             "proposals.list",
             "proposals.accept",
             "proposals.reject",
+            "proposals.count",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -845,6 +920,64 @@ mod tests {
                 .unwrap()
                 .contains("edit.replace_range")
         );
+    }
+
+    #[test]
+    fn buffer_version_tool_returns_current_version_after_edit() {
+        let mut state = fresh_state("buffer_version_tool");
+        let v_pre = state.buffer_version(SOLE_BUFFER_ID).unwrap();
+        state
+            .edit_replace_range(
+                SOLE_BUFFER_ID,
+                v_pre,
+                CharRange { start: 0, end: 0 },
+                "hi",
+            )
+            .unwrap();
+
+        let resp = call_tool(
+            &mut state,
+            "buffer.version",
+            json!({ "buffer_id": SOLE_BUFFER_ID }),
+            21,
+        );
+        assert_eq!(resp["result"]["isError"], false);
+        let payload: Value = serde_json::from_str(
+            resp["result"]["content"][0]["text"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["version"], state.buffer_version(SOLE_BUFFER_ID).unwrap());
+        assert!(payload["version"].as_u64().unwrap() > v_pre);
+    }
+
+    #[test]
+    fn proposals_count_tool_reflects_queue_size() {
+        let mut state = fresh_state("proposals_count_tool");
+        // Empty queue.
+        let empty = call_tool(&mut state, "proposals.count", json!({}), 30);
+        let body: Value = serde_json::from_str(
+            empty["result"]["content"][0]["text"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["count"], 0);
+
+        // Enqueue one proposal.
+        let v = state.buffer_version(SOLE_BUFFER_ID).unwrap();
+        state
+            .propose_replace_range(
+                SOLE_BUFFER_ID,
+                v,
+                CharRange { start: 0, end: 0 },
+                "x".into(),
+                "test".into(),
+            )
+            .unwrap();
+        let one = call_tool(&mut state, "proposals.count", json!({}), 31);
+        let body: Value = serde_json::from_str(
+            one["result"]["content"][0]["text"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["count"], 1);
     }
 
     #[test]

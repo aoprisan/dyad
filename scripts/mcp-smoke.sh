@@ -42,6 +42,9 @@ RESPONSES="$(
     printf '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"buffer.open","arguments":{"path":"%s"}}}\n' "$REPO_FILE"
     echo '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"git.status","arguments":{"buffer_id":2}}}'
     echo '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"git.log","arguments":{"buffer_id":2,"limit":3}}}'
+    # buffer.version reports the post-edit version (>0 after the id=5 replace).
+    echo '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"buffer.version","arguments":{"buffer_id":1}}}'
+    echo '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"proposals.count","arguments":{}}}'
   } | "$BIN" --mcp "$FIXTURE"
 )"
 
@@ -90,6 +93,10 @@ assert_contains 2 '"name":"edit.propose_range"'
 assert_contains 2 '"name":"proposals.list"'
 assert_contains 2 '"name":"proposals.accept"'
 assert_contains 2 '"name":"proposals.reject"'
+assert_contains 2 '"name":"proposals.count"'
+assert_contains 2 '"name":"buffer.version"'
+assert_contains 2 '"name":"symbol.references"'
+assert_contains 2 '"name":"symbol.hover"'
 assert_contains 3 'fn hello() {}'
 # id=4's payload is a JSON-stringified array inside an MCP text content
 # item, so quotes are backslash-escaped on the wire — match that form.
@@ -100,5 +107,10 @@ assert_contains 7 'fn farewell() {}'
 assert_contains 8 '\"buffer_id\":2'
 assert_contains 9 '"isError":false'
 assert_contains 10 '"isError":false'
+# buffer.version after the id=5 edit returns a non-zero u64.
+assert_contains 11 '"isError":false'
+assert_contains 11 '\"version\":'
+# Empty proposals queue.
+assert_contains 12 '\"count\":0'
 
 echo "PASS: mcp-smoke"

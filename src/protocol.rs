@@ -408,6 +408,36 @@ impl ProtocolState {
         lsp.definition(uri, line, character)
     }
 
+    /// All references to the symbol at `(line, character)`. The pair
+    /// with `symbol_definition` — most agents call definition first,
+    /// then references when they need to scope a rename / impact-analyze
+    /// a change. `include_declaration` defaults to `true` so the
+    /// definition shows up in the result alongside uses.
+    pub fn symbol_references(
+        &self,
+        buffer_id: u64,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+    ) -> Result<Vec<Location>> {
+        let (lsp, uri) = self.lsp_for_buffer(buffer_id)?;
+        lsp.references(uri, line, character, include_declaration)
+    }
+
+    /// Hover text for the symbol at `(line, character)`. Backs both the
+    /// `symbol.hover` and `symbol.signature` MCP tools — LSP exposes one
+    /// endpoint and the agent slices what it wants from the body.
+    /// Returns `None` when the server has nothing to say.
+    pub fn symbol_hover(
+        &self,
+        buffer_id: u64,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<String>> {
+        let (lsp, uri) = self.lsp_for_buffer(buffer_id)?;
+        lsp.hover(uri, line, character)
+    }
+
     /// Run `workspace/symbol` against the LSP client serving
     /// `buffer_id`. `buffer_id` only picks the language server (the
     /// query itself is workspace-wide), so any buffer in a supported
@@ -603,6 +633,13 @@ impl ProtocolState {
         Ok(())
     }
 
+    /// Number of proposals currently in the queue. Cheap status check
+    /// for agents that don't want to pay the cost of a full
+    /// `proposals.list` just to know whether anything is pending.
+    pub fn proposals_count(&self) -> usize {
+        self.proposals.count()
+    }
+
     // ---------- Git (Phase 9) ----------
 
     /// Raw `git diff HEAD --no-color -- <path>` for the buffer's file.
@@ -701,7 +738,9 @@ impl ProtocolState {
 
     // ---------- Read-only accessors (for tests + transport) ----------
 
-    #[allow(dead_code)] // Used by tests; an MCP `buffer.version` wrapper can land later.
+    /// Current buffer version (the optimistic-concurrency token edits
+    /// must reference). Cheaper than a full `buffer.read` when the
+    /// agent only wants to check whether something has moved.
     pub fn buffer_version(&self, buffer_id: u64) -> Result<u64> {
         Ok(self.buffer_entry(buffer_id)?.buffer.version())
     }

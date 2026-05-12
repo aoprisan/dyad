@@ -14,18 +14,12 @@ spec'd" means it would help agents but isn't in the design doc yet.
 - `git.status`, `git.log`, `git.show`, `git.stage`, `git.unstage`,
   `git.commit` — wired through `ProtocolState` and `mcp.rs`; smoke
   covers `git.status` + `git.log` round-trips.
-
-## High leverage, low effort
-
-These are single-method wrappers over code that already exists in
-`src/lsp.rs` and `src/proposals.rs`.
-
-- `symbol.references` — LSP `textDocument/references`; pairs with
+- `symbol.references` — LSP `textDocument/references`, paired with
   the existing `symbol.definition`.
-- `symbol.signature` / `symbol.hover` — LSP `textDocument/hover`.
-- `buffer.version(id)` — `ProtocolState::buffer_version` is already
-  `#[allow(dead_code)]` awaiting an MCP wrapper.
-- `proposals.count` — one-line wrapper over `ProposalQueue::count()`.
+- `symbol.hover` — LSP `textDocument/hover` (also covers the
+  `symbol.signature` slot; same endpoint, agent slices the body).
+- `buffer.version(id)` — thin wrapper exposing `Buffer::version`.
+- `proposals.count` — wrapper over `ProposalQueue::count()`.
 
 ## High leverage, medium effort
 
@@ -82,7 +76,10 @@ These are single-method wrappers over code that already exists in
 
 ## Suggested next slice
 
-Pick up the four **High-leverage, low-effort** bullets in one PR
-(`symbol.references`, `symbol.signature`/`hover`, `buffer.version`,
-`proposals.count`). Each is a thin MCP wrapper, smoke-script roundtrip
-trivially extends what's already in `scripts/mcp-smoke.sh`.
+With the low-effort LSP/proposal wrappers landed, the next concentrated
+slice is **High-leverage, medium-effort** workspace navigation: a small
+set of read-only filesystem + search verbs (`fs.list`, `fs.exists`,
+`search.text`, `workspace.root`, `workspace.languages`) that an agent
+needs before it can productively use `symbol.workspace_search` and the
+edit tools. Each one is a thin wrapper, but together they unblock the
+"agent navigates the repo without shelling out" loop.
