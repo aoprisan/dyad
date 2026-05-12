@@ -124,6 +124,53 @@ fn tools_list_result() -> Value {
                     "buffer_id": {"type": "integer"},
                 },
             })),
+            tool_def("git.status", "List `git status --porcelain=v1` entries for the repo containing the buffer's file. Each entry: {path, staged, unstaged}; staged/unstaged are porcelain chars (space = unchanged, M/A/D/?/etc).", json!({
+                "type": "object",
+                "required": ["buffer_id"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                },
+            })),
+            tool_def("git.log", "Most recent `limit` commits in the buffer's repo. Each entry: {sha, short_sha, author, date, subject}.", json!({
+                "type": "object",
+                "required": ["buffer_id", "limit"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                    "limit":     {"type": "integer", "minimum": 1},
+                },
+            })),
+            tool_def("git.show", "Full `git show --no-color <sha>` output for a commit in the buffer's repo. SHA accepted in any form git recognises (full, short, ref).", json!({
+                "type": "object",
+                "required": ["buffer_id", "sha"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                    "sha":       {"type": "string"},
+                },
+            })),
+            tool_def("git.stage", "Stage a file via `git add`. When `path` is omitted, stages the buffer's own file. When set, takes the string as a path relative to the repo root.", json!({
+                "type": "object",
+                "required": ["buffer_id"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                    "path":      {"type": "string"},
+                },
+            })),
+            tool_def("git.unstage", "Unstage a file via `git restore --staged`. Same path semantics as git.stage.", json!({
+                "type": "object",
+                "required": ["buffer_id"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                    "path":      {"type": "string"},
+                },
+            })),
+            tool_def("git.commit", "Commit currently-staged changes with `message`. Returns git's stdout. Pre-commit hook failures and 'nothing to commit' surface as the error text.", json!({
+                "type": "object",
+                "required": ["buffer_id", "message"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                    "message":   {"type": "string"},
+                },
+            })),
             tool_def("edit.propose_range", "Queue an `edit.replace_range` for review instead of applying it. Returns a proposal_id. The reviewer (eventually a human at the TUI) accepts or rejects via the `proposals.*` tools.", json!({
                 "type": "object",
                 "required": ["buffer_id", "version", "range", "text", "intent"],
@@ -350,6 +397,63 @@ fn dispatch_tool(
             let a: Args = serde_json::from_value(args)?;
             let diff = state.git_diff(a.buffer_id)?;
             Ok(json!({ "diff": diff }))
+        }
+        "git.status" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            Ok(json!(state.git_status(a.buffer_id)?))
+        }
+        "git.log" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+                limit: usize,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            Ok(json!(state.git_log(a.buffer_id, a.limit)?))
+        }
+        "git.show" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+                sha: String,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            let patch = state.git_show(a.buffer_id, &a.sha)?;
+            Ok(json!({ "patch": patch }))
+        }
+        "git.stage" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+                path: Option<String>,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            state.git_stage(a.buffer_id, a.path.as_deref())?;
+            Ok(json!({}))
+        }
+        "git.unstage" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+                path: Option<String>,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            state.git_unstage(a.buffer_id, a.path.as_deref())?;
+            Ok(json!({}))
+        }
+        "git.commit" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+                message: String,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            let output = state.git_commit(a.buffer_id, &a.message)?;
+            Ok(json!({ "output": output }))
         }
         "edit.propose_range" => {
             #[derive(Deserialize)]
@@ -641,6 +745,12 @@ mod tests {
             "buffer.close",
             "clients.list",
             "git.diff",
+            "git.status",
+            "git.log",
+            "git.show",
+            "git.stage",
+            "git.unstage",
+            "git.commit",
             "edit.propose_range",
             "proposals.list",
             "proposals.accept",

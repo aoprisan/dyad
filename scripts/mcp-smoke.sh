@@ -26,6 +26,7 @@ fi
 # A small awk-driven runner: feed multiple JSON-RPC lines into the
 # binary, capture all output, then assert on individual responses by
 # their JSON-RPC `id`.
+REPO_FILE="${ROOT}/Cargo.toml"
 RESPONSES="$(
   {
     echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
@@ -36,6 +37,11 @@ RESPONSES="$(
     echo '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"edit.replace_range","arguments":{"buffer_id":1,"version":0,"range":{"start":3,"end":8},"text":"farewell"}}}'
     echo '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"history.recent","arguments":{"limit":10}}}'
     echo '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"buffer.read","arguments":{"buffer_id":1}}}'
+    # buffer.open a file inside the dyad repo so git ops have a real repo
+    # to read against. The FIXTURE lives in /tmp and is not in any repo.
+    printf '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"buffer.open","arguments":{"path":"%s"}}}\n' "$REPO_FILE"
+    echo '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"git.status","arguments":{"buffer_id":2}}}'
+    echo '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"git.log","arguments":{"buffer_id":2,"limit":3}}}'
   } | "$BIN" --mcp "$FIXTURE"
 )"
 
@@ -74,6 +80,12 @@ assert_contains 2 '"name":"buffer.open"'
 assert_contains 2 '"name":"buffer.close"'
 assert_contains 2 '"name":"clients.list"'
 assert_contains 2 '"name":"git.diff"'
+assert_contains 2 '"name":"git.status"'
+assert_contains 2 '"name":"git.log"'
+assert_contains 2 '"name":"git.show"'
+assert_contains 2 '"name":"git.stage"'
+assert_contains 2 '"name":"git.unstage"'
+assert_contains 2 '"name":"git.commit"'
 assert_contains 2 '"name":"edit.propose_range"'
 assert_contains 2 '"name":"proposals.list"'
 assert_contains 2 '"name":"proposals.accept"'
@@ -85,5 +97,8 @@ assert_contains 4 '\"capture\":\"name\"'
 assert_contains 5 '"isError":false'
 assert_contains 6 'edit.replace_range'
 assert_contains 7 'fn farewell() {}'
+assert_contains 8 '\"buffer_id\":2'
+assert_contains 9 '"isError":false'
+assert_contains 10 '"isError":false'
 
 echo "PASS: mcp-smoke"

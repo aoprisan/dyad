@@ -619,6 +619,86 @@ impl ProtocolState {
         git::diff_text(path)
     }
 
+    /// `git status --porcelain=v1` for the repo containing the buffer's
+    /// file. Returns all entries — caller filters if needed.
+    pub fn git_status(&self, buffer_id: u64) -> Result<Vec<git::StatusEntry>> {
+        let repo_root = self.repo_root_for_buffer(buffer_id)?;
+        git::status_at(&repo_root)
+    }
+
+    /// Most recent `limit` commits in the repo containing the buffer's
+    /// file. Errors when the repo has no commits yet — consistent with
+    /// `git log`'s own behavior.
+    pub fn git_log(&self, buffer_id: u64, limit: usize) -> Result<Vec<git::LogEntry>> {
+        let repo_root = self.repo_root_for_buffer(buffer_id)?;
+        git::log(&repo_root, limit)
+    }
+
+    /// Full `git show` output for a commit (SHA, ref, or short SHA —
+    /// anything `git` itself accepts).
+    pub fn git_show(&self, buffer_id: u64, sha: &str) -> Result<String> {
+        let repo_root = self.repo_root_for_buffer(buffer_id)?;
+        git::show_commit(&repo_root, sha)
+    }
+
+    /// Stage a file in the repo containing the buffer. When `path` is
+    /// `None`, the buffer's own file is staged. When `Some`, the string
+    /// is passed to `git add` as a path relative to the repo root.
+    pub fn git_stage(&self, buffer_id: u64, path: Option<&str>) -> Result<()> {
+        let (repo_root, rel) = self.stage_target(buffer_id, path)?;
+        git::stage(&repo_root, &rel)
+    }
+
+    /// Unstage a file. Same path semantics as `git_stage`.
+    pub fn git_unstage(&self, buffer_id: u64, path: Option<&str>) -> Result<()> {
+        let (repo_root, rel) = self.stage_target(buffer_id, path)?;
+        git::unstage(&repo_root, &rel)
+    }
+
+    /// Commit currently-staged changes in the repo containing the
+    /// buffer. Returns `git commit`'s stdout (typically the summary
+    /// line). Pre-commit hook failures and "nothing to commit" reach
+    /// the caller as the error string.
+    pub fn git_commit(&self, buffer_id: u64, message: &str) -> Result<String> {
+        let repo_root = self.repo_root_for_buffer(buffer_id)?;
+        git::commit(&repo_root, message)
+    }
+
+    fn repo_root_for_buffer(&self, buffer_id: u64) -> Result<PathBuf> {
+        let entry = self.buffer_entry(buffer_id)?;
+        let path = entry
+            .buffer
+            .path()
+            .context("buffer has no path; cannot locate a git repo")?;
+        git::repo_root_for(path)
+    }
+
+    /// Resolve `(repo_root, rel_path)` for stage/unstage. When `path`
+    /// is `None`, the buffer's own file (relative to the repo root) is
+    /// the target. When `path` is `Some`, the string is taken as a
+    /// repo-root-relative path verbatim — `git` itself rejects anything
+    /// outside the worktree.
+    fn stage_target(
+        &self,
+        buffer_id: u64,
+        path: Option<&str>,
+    ) -> Result<(PathBuf, PathBuf)> {
+        let entry = self.buffer_entry(buffer_id)?;
+        let buf_path = entry
+            .buffer
+            .path()
+            .context("buffer has no path; cannot locate a git repo")?;
+        let repo_root = git::repo_root_for(buf_path)?;
+        let rel = match path {
+            Some(p) => PathBuf::from(p),
+            None => buf_path
+                .strip_prefix(&repo_root)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|_| buf_path.to_path_buf()),
+        };
+        Ok((repo_root, rel))
+    }
+
     // ---------- Read-only accessors (for tests + transport) ----------
 
     #[allow(dead_code)] // Used by tests; an MCP `buffer.version` wrapper can land later.

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineStatus {
@@ -27,7 +28,7 @@ pub enum LineStatus {
 /// (index vs HEAD), `unstaged` is Y (working tree vs index). Both
 /// chars use the porcelain alphabet: space = unchanged, M/A/D/R/C/U
 /// for the usual states, `?` for untracked.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StatusEntry {
     pub path: PathBuf,
     pub staged: char,
@@ -37,7 +38,7 @@ pub struct StatusEntry {
 /// One entry from `git log --pretty=format:...`. SHA in full and
 /// short form so the UI can render the short version while
 /// `show` keeps using the unambiguous full SHA.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LogEntry {
     pub sha: String,
     pub short_sha: String,
