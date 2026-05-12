@@ -16,7 +16,9 @@ in. Multi-client awareness (Phase 8) is partial: multiple buffers per
 `ProtocolState`, but no concurrent TUI+MCP session split yet.
 
 Each source file's module doc-comment names the phase it belongs to and what's
-deferred — read those before extending a module.
+deferred — read those before extending a module. `ROADMAP.md` tracks the
+MCP/protocol features still missing for an agent client to be fully symmetric
+with the TUI.
 
 ## Commands
 
@@ -24,14 +26,18 @@ deferred — read those before extending a module.
 cargo build                                 # build
 cargo run -- <path>                         # open <path> in the TUI (created on save if missing)
 cargo run -- <path> --mcp                   # run as an MCP server over stdio (JSON-RPC 2.0, line-delimited)
+cargo run -- --install                      # symlink the built binary into ~/.local/bin
 cargo clippy --all-targets -- -D warnings   # lint (must stay clean)
 
-cargo build --release && scripts/mcp-smoke.sh   # end-to-end MCP smoke test — the closest thing to a test suite
+cargo test                                  # unit tests in src/ + integration tests in tests/
+cargo build --release && scripts/mcp-smoke.sh   # extra end-to-end MCP smoke check
 ```
 
-There is no `cargo test` suite yet. `scripts/mcp-smoke.sh` is the regression
-gate for the MCP protocol surface — re-run it after any protocol or transport
-change. The TUI is exercised manually.
+`cargo test` is the primary regression gate. `tests/mcp_integration.rs` and
+`tests/buffer_io_integration.rs` spawn `dyad --mcp` as a subprocess and drive
+it via JSON-RPC — that's the canonical way to test the agent-facing surface.
+`scripts/mcp-smoke.sh` is a thinner shell-based smoke that predates the
+integration tests and still works. The TUI is exercised manually.
 
 ## Architecture
 
@@ -89,11 +95,20 @@ the "symmetric clients" invariant from `DESIGN.md`.
   `refresh` consumes the buffer's `pending_edits`, reparses incrementally,
   and produces per-line highlight spans for the renderer. Same tree backs
   `ast.query` and `edit.replace_node`.
-- `lsp.rs` — `rust-analyzer` client. Spawned lazily on first `.rs` open;
-  shared across `.rs` buffers in the same workspace. Reader thread updates
-  the diagnostics cache; writer thread (main) sends requests. **Fail-graceful**:
-  if `rust-analyzer` isn't on `PATH` or initialize times out, `spawn_rust`
-  returns `Err` and everything else keeps working without LSP.
+- `language.rs` — `Language` enum + per-language descriptors (binary name,
+  install hint, workspace markers, capability flags). The single source of
+  truth threaded through `syntax.rs`, `lsp.rs`, and `protocol.rs`. Adding a
+  third language is two steps: extend the enum, fill out the descriptor
+  methods. Currently covers `Rust` (`rust-analyzer`) and `Scala` (`metals`,
+  including `.sc` and `.sbt`).
+- `lsp.rs` — generic LSP client driven by `Language`. Spawned lazily on first
+  open of a recognized extension via `LspClient::spawn(language, …)`; shared
+  across buffers in the same workspace. Reader thread updates the diagnostics
+  cache; writer thread (main) sends requests. **Fail-graceful**: if the
+  server binary isn't on `PATH` or initialize times out, `spawn` returns
+  `Err` and everything else keeps working without LSP. Metals' first import
+  is slow (>30s); the indexing-status hooks in `language.rs` drive the
+  status-line indicator.
 - `git.rs` — shells out to `git` for status, diff, log, stage, commit.
   Per-line `LineStatus` against `HEAD` is what the gutter renders.
 - `proposals.rs` — Phase 10 queue. `edit.propose_range` enqueues; another
@@ -110,6 +125,9 @@ the "symmetric clients" invariant from `DESIGN.md`.
 - `terminal.rs` — RAII `Guard` around `ratatui::try_init`/`restore`. The
   `try_init` call installs a panic hook that restores the terminal before the
   panic message prints.
+- `install.rs` — `dyad --install`: symlinks the current binary into
+  `~/.local/bin`. Refuses to overwrite anything that isn't already a symlink,
+  so it won't clobber a user-owned file.
 
 ## Invariants to preserve
 
