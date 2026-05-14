@@ -571,6 +571,15 @@ impl App {
                     // Cursor position stays the same (chars shift left).
                 }
             }
+            Action::ClearLine => {
+                let line = self.view.cursor_line();
+                let start = self.buffer.line_to_char(line);
+                let len = self.buffer.line_len_chars(line);
+                if len > 0 {
+                    self.buffer.delete_range(start..start + len);
+                }
+                self.view.goto(&self.buffer, line, 0);
+            }
             Action::MoveLeft => self.view.move_left(&self.buffer),
             Action::MoveRight => self.view.move_right(&self.buffer),
             Action::MoveUp => self.view.move_up(&self.buffer),
@@ -2342,6 +2351,7 @@ fn action_intent(action: &Action) -> Option<String> {
         Action::Insert(c) => Some(format!("insert {}", describe_char(*c))),
         Action::DeletePrev => Some("delete backward".into()),
         Action::DeleteNext => Some("delete forward".into()),
+        Action::ClearLine => Some("clear line".into()),
         Action::MoveLeft
         | Action::MoveRight
         | Action::MoveUp

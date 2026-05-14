@@ -71,7 +71,7 @@ up this same table as an overlay:
 | Ctrl-W    | Toggle autosave (~500 ms idle)          |
 | Ctrl-Q    | Quit (press twice when dirty)           |
 
-### LSP (Rust files, `rust-analyzer` on PATH)
+### LSP
 
 | Key                   | Action                                              |
 | --------------------- | --------------------------------------------------- |
@@ -87,9 +87,14 @@ up this same table as an overlay:
 | F12, Ctrl-]           | Go to definition — direct escape hatch              |
 
 LSP-backed features (diagnostics on the status bar, go-to-definition, hover,
-rename, workspace symbol search) light up automatically when the file is
-`.rs` and `rust-analyzer` is on `PATH`. They stay dark otherwise — the editor
-falls back to plain text editing.
+rename, workspace symbol search) light up automatically when a supported
+language server is on `PATH`:
+
+- `.rs` files — `rust-analyzer` (`rustup component add rust-analyzer`)
+- `.scala` / `.sc` / `.sbt` files — `metals` (`coursier install metals`)
+- `.elm` files — `elm-language-server` (`npm install -g @elm-tooling/elm-language-server`)
+
+They stay dark otherwise — the editor falls back to plain text editing.
 
 ### Motion
 
@@ -100,6 +105,12 @@ falls back to plain text editing.
 | Ctrl-A / Ctrl-E      | Line start / end                        |
 | Ctrl-U / Ctrl-D      | Page up / down                          |
 | Home / End           | Line start / end                        |
+
+### Edit
+
+| Key       | Action                                          |
+| --------- | ----------------------------------------------- |
+| Ctrl-C    | Clear current line (keep newline, cursor → col 0) |
 
 ### Tree (when focused)
 

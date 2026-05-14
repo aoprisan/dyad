@@ -380,6 +380,8 @@ const KEYS_HELP: &[KeyRow] = &[
     KeyRow::Binding("Ctrl-A / Ctrl-E", "line start / end"),
     KeyRow::Binding("Ctrl-U / Ctrl-D", "page up / down"),
     KeyRow::Binding("Home / End", "line start / end"),
+    KeyRow::Section("Edit"),
+    KeyRow::Binding("Ctrl-C", "clear current line (keep newline)"),
     KeyRow::Section("Tree (when focused)"),
     KeyRow::Binding("Up / Down", "move selection"),
     KeyRow::Binding("Enter", "open file / expand dir / ascend ↰ .."),

@@ -419,4 +419,47 @@ mod tests {
         // line_to_char(1) = 3, col 2 => char_idx = 5.
         assert_eq!(v.char_idx(&buf), 5);
     }
+
+    /// Mirror of `App::apply(Action::ClearLine)`: deleting the current
+    /// line's chars (excluding the trailing newline) leaves the line in
+    /// place and parks the cursor at column 0.
+    #[test]
+    fn clear_line_composite_empties_line_keeps_newline() {
+        let mut buf = buffer_with("first\nsecond\nthird\n");
+        let mut v = View::new();
+        v.goto(&buf, 1, 4);
+
+        let line = v.cursor_line();
+        let start = buf.line_to_char(line);
+        let len = buf.line_len_chars(line);
+        buf.delete_range(start..start + len);
+        v.goto(&buf, line, 0);
+
+        assert_eq!(buf.line_count(), 4);
+        assert_eq!(buf.line_len_chars(1), 0);
+        assert_eq!(buf.rope().to_string(), "first\n\nthird\n");
+        assert_eq!((v.cursor_line(), v.cursor_col()), (1, 0));
+    }
+
+    /// Clearing an already-empty line is a no-op on the rope (matches
+    /// `Buffer::delete_range`'s start>=end short-circuit) and still
+    /// homes the cursor.
+    #[test]
+    fn clear_line_composite_on_empty_line_is_noop() {
+        let mut buf = buffer_with("foo\n\nbar\n");
+        let mut v = View::new();
+        v.goto(&buf, 1, 0);
+        let before = buf.version();
+
+        let line = v.cursor_line();
+        let start = buf.line_to_char(line);
+        let len = buf.line_len_chars(line);
+        if len > 0 {
+            buf.delete_range(start..start + len);
+        }
+        v.goto(&buf, line, 0);
+
+        assert_eq!(buf.version(), before);
+        assert_eq!((v.cursor_line(), v.cursor_col()), (1, 0));
+    }
 }

@@ -118,8 +118,13 @@ pub fn map(ev: KeyEvent) -> Option<Action> {
                     // above is the kitty-protocol primary; Ctrl-V is
                     // the universal fallback because every other
                     // single Ctrl-letter is either bound or eaten
-                    // by the terminal (C/H/I/J/M/Z).
+                    // by the terminal (H/I/J/M/Z).
                     'v' => Some(Action::GoToLine),
+                    // Ctrl-C ("clear"): empty the current line, keep
+                    // the newline in place, drop the cursor to col 0.
+                    // Quit lives on Ctrl-Q, so Ctrl-C is free to reuse
+                    // as an editing key under crossterm's raw mode.
+                    'c' => Some(Action::ClearLine),
                     _ => None,
                 }
             } else if alt {
@@ -276,6 +281,7 @@ mod tests {
             ('p', Action::ToggleKeysHelp),
             ('x', Action::OpenFile),
             ('v', Action::GoToLine),
+            ('c', Action::ClearLine),
         ];
         for (c, expected) in pairs {
             let got = map(ctrl(*c))
