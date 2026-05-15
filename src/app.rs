@@ -19,6 +19,19 @@ use crate::tx::TxManager;
 use crate::ui;
 use crate::view::View;
 
+/// TUI input mode. The agent path (`ProtocolState`) ignores this — it's
+/// purely a guard for the keyboard so a stray keystroke can't mutate the
+/// buffer while the human is reading code that an MCP agent may also be
+/// editing. See CLAUDE.md "symmetric clients" invariant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Read-only. Movement, modals, save, and quit work; insert / delete
+    /// / clear-line / LSP-rename are blocked and surface a status hint.
+    View,
+    /// Default editing behavior — every key behaves as it did pre-mode.
+    Edit,
+}
+
 pub struct App {
     pub buffer: Buffer,
     pub view: View,
@@ -96,6 +109,11 @@ pub struct App {
     /// `resolve_chord` to pick a destination. Cleared on any
     /// keystroke whether it matches a chord arm or not.
     pub chord: Option<Chord>,
+    /// Current input mode. Starts in `View` when launched on a file
+    /// (the user's reading workflow is the default), `Edit` for a
+    /// scratch buffer (no path yet, so the user is necessarily about
+    /// to create content). Toggle with `Ctrl-M`.
+    pub mode: Mode,
 }
 
 #[derive(Clone, Copy)]
@@ -305,6 +323,7 @@ impl App {
             prompt: None,
             autosave: false,
             last_edit: None,
+            mode: Mode::View,
         })
     }
 
@@ -339,6 +358,7 @@ impl App {
             prompt: None,
             autosave: false,
             last_edit: None,
+            mode: Mode::Edit,
         })
     }
 
@@ -479,6 +499,17 @@ impl App {
                 };
                 return Ok(());
             }
+            Action::ToggleMode => {
+                self.mode = match self.mode {
+                    Mode::View => Mode::Edit,
+                    Mode::Edit => Mode::View,
+                };
+                self.status = match self.mode {
+                    Mode::View => "View mode".into(),
+                    Mode::Edit => "Edit mode".into(),
+                };
+                return Ok(());
+            }
             Action::Escape => {
                 if self.keys_help {
                     self.keys_help = false;
@@ -538,6 +569,25 @@ impl App {
                 return Ok(());
             }
             _ => {}
+        }
+
+        // View-mode gate. Block buffer-mutating actions before the auto-tx
+        // opens so a stray keystroke can't even start a transaction. The
+        // agent path (`ProtocolState`) is independent of this — MCP edits
+        // keep landing in either mode, preserving the symmetric-clients
+        // invariant.
+        if matches!(self.mode, Mode::View)
+            && matches!(
+                action,
+                Action::Insert(_)
+                    | Action::DeletePrev
+                    | Action::DeleteNext
+                    | Action::ClearLine
+                    | Action::Rename
+            )
+        {
+            self.status = "View mode — Ctrl-M to edit".into();
+            return Ok(());
         }
 
         // Open an auto-tx for buffer-mutating actions so every edit lands
@@ -639,6 +689,7 @@ impl App {
             | Action::GoToLine
             | Action::CtrlGPrefix
             | Action::ToggleAutosave
+            | Action::ToggleMode
             | Action::Escape => {}
             // Listed for exhaustiveness — `ShowType`/`Rename` are
             // handled in their own arms above.
@@ -2377,6 +2428,7 @@ fn action_intent(action: &Action) -> Option<String> {
         | Action::OpenTextSearch
         | Action::NewFile
         | Action::ToggleAutosave
+        | Action::ToggleMode
         | Action::ShowType
         | Action::Rename
         | Action::Escape => None,
@@ -2556,6 +2608,96 @@ fn foo(
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].col, 6);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Build an App on a temp file with a `.txt` extension so we
+    /// sidestep LSP spawn and language detection — just a buffer with
+    /// a real path.
+    fn app_on_temp_txt(label: &str, contents: &str) -> (App, PathBuf) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "dyad-mode-{label}-{}-{nanos}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        let app = App::new(path.clone()).unwrap();
+        (app, path)
+    }
+
+    #[test]
+    fn opens_file_in_view_mode_by_default() {
+        let (app, path) = app_on_temp_txt("default-view", "hello\n");
+        assert_eq!(app.mode, Mode::View);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn view_mode_blocks_insert_and_preserves_buffer() {
+        let (mut app, path) = app_on_temp_txt("block-insert", "hello\n");
+        assert_eq!(app.mode, Mode::View);
+        let before = app.buffer.rope().to_string();
+        let before_version = app.buffer.version();
+        app.apply(Action::Insert('x')).unwrap();
+        // Buffer text and version untouched — the gate fired before any
+        // mutation could open a transaction.
+        assert_eq!(app.buffer.rope().to_string(), before);
+        assert_eq!(app.buffer.version(), before_version);
+        assert!(!app.buffer.is_dirty());
+        assert!(app.status.contains("View mode"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn view_mode_blocks_delete_and_clear_line() {
+        let (mut app, path) = app_on_temp_txt("block-del", "hello\nworld\n");
+        let before = app.buffer.rope().to_string();
+        app.apply(Action::DeleteNext).unwrap();
+        app.apply(Action::DeletePrev).unwrap();
+        app.apply(Action::ClearLine).unwrap();
+        assert_eq!(app.buffer.rope().to_string(), before);
+        assert!(!app.buffer.is_dirty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn toggle_mode_flips_view_and_edit() {
+        let (mut app, path) = app_on_temp_txt("toggle", "hello\n");
+        assert_eq!(app.mode, Mode::View);
+        app.apply(Action::ToggleMode).unwrap();
+        assert_eq!(app.mode, Mode::Edit);
+        app.apply(Action::ToggleMode).unwrap();
+        assert_eq!(app.mode, Mode::View);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn edit_mode_allows_insert() {
+        let (mut app, path) = app_on_temp_txt("edit-allows", "hello\n");
+        app.apply(Action::ToggleMode).unwrap();
+        assert_eq!(app.mode, Mode::Edit);
+        app.apply(Action::Insert('X')).unwrap();
+        // Cursor starts at (0, 0); 'X' inserts at the very beginning.
+        assert!(app.buffer.rope().to_string().starts_with('X'));
+        assert!(app.buffer.is_dirty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn view_mode_allows_movement_and_save() {
+        let (mut app, path) = app_on_temp_txt("view-nav", "ab\ncd\n");
+        // Movement should work freely in View mode.
+        app.apply(Action::MoveDown).unwrap();
+        app.apply(Action::MoveRight).unwrap();
+        assert_eq!(app.view.cursor_line(), 1);
+        assert_eq!(app.view.cursor_col(), 1);
+        // Save passes through — the buffer wasn't dirty, but the action
+        // shouldn't be blocked.
+        app.apply(Action::Save).unwrap();
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

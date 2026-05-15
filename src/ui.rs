@@ -381,6 +381,7 @@ const KEYS_HELP: &[KeyRow] = &[
     KeyRow::Binding("Ctrl-U / Ctrl-D", "page up / down"),
     KeyRow::Binding("Home / End", "line start / end"),
     KeyRow::Section("Edit"),
+    KeyRow::Binding("Ctrl-M", "toggle View / Edit mode"),
     KeyRow::Binding("Ctrl-C", "clear current line (keep newline)"),
     KeyRow::Section("Tree (when focused)"),
     KeyRow::Binding("Up / Down", "move selection"),
@@ -761,16 +762,33 @@ fn render_status(frame: &mut Frame, rect: Rect, app: &App) {
     } else {
         None
     };
+    // VIEW badge is yellow (mode-warning palette) so the user can see at
+    // a glance that the keyboard is locked. EDIT renders no badge to keep
+    // the chrome quiet — it's the default working state.
+    let mode_badge = match app.mode {
+        crate::app::Mode::View => Some(Span::styled(
+            "VIEW ",
+            theme::status_bar().fg(theme::warn()),
+        )),
+        crate::app::Mode::Edit => None,
+    };
 
     let total_width = rect.width as usize;
     let badge_len = lsp_badge.as_ref().map(|s| s.content.chars().count()).unwrap_or(0)
         + autosave_badge
             .as_ref()
             .map(|s| s.content.chars().count())
+            .unwrap_or(0)
+        + mode_badge
+            .as_ref()
+            .map(|s| s.content.chars().count())
             .unwrap_or(0);
     let combined_len = left.chars().count() + badge_len + right_text.chars().count();
     let pad = total_width.saturating_sub(combined_len);
     let mut spans = vec![Span::styled(left, bar)];
+    if let Some(badge) = mode_badge {
+        spans.push(badge);
+    }
     if let Some(badge) = autosave_badge {
         spans.push(badge);
     }

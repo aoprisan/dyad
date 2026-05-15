@@ -35,5 +35,8 @@ pub enum Action {
     OpenTextSearch,
     NewFile,
     ToggleAutosave,
+    /// Flip between `Mode::View` (read-only TUI) and `Mode::Edit`. The
+    /// agent path is unaffected — MCP edits keep landing in either mode.
+    ToggleMode,
     Escape,
 }
