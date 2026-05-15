@@ -125,6 +125,12 @@ pub fn map(ev: KeyEvent) -> Option<Action> {
                     // Quit lives on Ctrl-Q, so Ctrl-C is free to reuse
                     // as an editing key under crossterm's raw mode.
                     'c' => Some(Action::ClearLine),
+                    // Ctrl-M ("mode"): toggle between View (read-only)
+                    // and Edit. Terminals deliver Enter as Ctrl-M too,
+                    // but Enter is matched as KeyCode::Enter higher up
+                    // (line ~30) before reaching this branch, so there's
+                    // no collision.
+                    'm' => Some(Action::ToggleMode),
                     _ => None,
                 }
             } else if alt {
@@ -282,6 +288,7 @@ mod tests {
             ('x', Action::OpenFile),
             ('v', Action::GoToLine),
             ('c', Action::ClearLine),
+            ('m', Action::ToggleMode),
         ];
         for (c, expected) in pairs {
             let got = map(ctrl(*c))
