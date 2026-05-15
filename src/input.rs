@@ -113,24 +113,23 @@ pub fn map(ev: KeyEvent) -> Option<Action> {
                     // against every non-hidden file under the root;
                     // Up/Down picks, Enter opens, Esc cancels.
                     'x' => Some(Action::OpenFile),
-                    // Ctrl-V ("visit line"): prompt for a 1-based
-                    // line number and jump. The Ctrl-Shift-G slot
-                    // above is the kitty-protocol primary; Ctrl-V is
-                    // the universal fallback because every other
-                    // single Ctrl-letter is either bound or eaten
-                    // by the terminal (H/I/J/M/Z).
-                    'v' => Some(Action::GoToLine),
+                    // Ctrl-V ("View"): toggle View (read-only) /
+                    // Edit. Single-Ctrl-letter is the only reliably
+                    // deliverable modifier on the project's target
+                    // terminals (Ctrl-Shift, Alt, F-keys, Ctrl-symbol
+                    // are all flaky on macOS Terminal/iTerm without
+                    // CSI-u). Ctrl-M would be the obvious mnemonic
+                    // but is ASCII 0x0D = Enter and crossterm
+                    // reports it as `KeyCode::Enter` (handled
+                    // above) — it never reaches this branch. The
+                    // previous Ctrl-V → GoToLine binding stays
+                    // available via the Ctrl-G chord (g/v/l) below.
+                    'v' => Some(Action::ToggleMode),
                     // Ctrl-C ("clear"): empty the current line, keep
                     // the newline in place, drop the cursor to col 0.
                     // Quit lives on Ctrl-Q, so Ctrl-C is free to reuse
                     // as an editing key under crossterm's raw mode.
                     'c' => Some(Action::ClearLine),
-                    // Ctrl-M ("mode"): toggle between View (read-only)
-                    // and Edit. Terminals deliver Enter as Ctrl-M too,
-                    // but Enter is matched as KeyCode::Enter higher up
-                    // (line ~30) before reaching this branch, so there's
-                    // no collision.
-                    'm' => Some(Action::ToggleMode),
                     _ => None,
                 }
             } else if alt {
@@ -286,9 +285,8 @@ mod tests {
             ('y', Action::Rename),
             ('p', Action::ToggleKeysHelp),
             ('x', Action::OpenFile),
-            ('v', Action::GoToLine),
+            ('v', Action::ToggleMode),
             ('c', Action::ClearLine),
-            ('m', Action::ToggleMode),
         ];
         for (c, expected) in pairs {
             let got = map(ctrl(*c))

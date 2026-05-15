@@ -112,7 +112,8 @@ pub struct App {
     /// Current input mode. Starts in `View` when launched on a file
     /// (the user's reading workflow is the default), `Edit` for a
     /// scratch buffer (no path yet, so the user is necessarily about
-    /// to create content). Toggle with `Ctrl-M`.
+    /// to create content). `open_file` resets back to `View` on every
+    /// cross-file navigation. Toggle with `Ctrl-V`.
     pub mode: Mode,
 }
 
@@ -586,7 +587,7 @@ impl App {
                     | Action::Rename
             )
         {
-            self.status = "View mode — Ctrl-M to edit".into();
+            self.status = "View mode — Ctrl-V to edit".into();
             return Ok(());
         }
 
@@ -1975,6 +1976,11 @@ impl App {
         self.language = new_language;
         self.lsp_version = 0;
         self.view = View::new();
+        // Opening a path-bearing file lands in View, matching the
+        // `App::new(path)` constructor. Without this, starting from
+        // `dyad <dir>` (Edit mode for the empty scratch buffer) and
+        // then picking a file in the tree leaves the user in Edit.
+        self.mode = Mode::View;
         // Keep the tree's cursor in sync with whatever file is now
         // loaded so a subsequent Ctrl-T lands on it without a second
         // navigation step. No-op when the file is outside the tree

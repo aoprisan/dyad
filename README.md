@@ -46,8 +46,17 @@ cargo clippy --all-targets -- -D warnings
 
 ## Keybindings (TUI)
 
-Non-modal — letter keys always insert. Press **Ctrl-P** in the editor to pop
-up this same table as an overlay:
+Letter keys always insert when the buffer is in **Edit** mode. Opening a
+file lands you in **View** mode (read-only) so a stray keystroke during
+review can't land in the buffer; scratch buffers (no path yet) open in
+Edit. A yellow `VIEW` badge in the status bar surfaces the locked state.
+The agent path is unaffected — MCP edits land in either mode.
+
+| Key       | Action                                            |
+| --------- | ------------------------------------------------- |
+| Ctrl-V    | Toggle View / Edit mode                           |
+
+Press **Ctrl-P** in the editor to pop up the full keymap as an overlay:
 
 ![Ctrl-P keymap overlay](keys.png)
 
@@ -83,7 +92,6 @@ up this same table as an overlay:
 | Ctrl-O                | Back (navigation stack) — direct                    |
 | Ctrl-K                | Show type at cursor (hover)                         |
 | Ctrl-Y                | Rename symbol                                       |
-| Ctrl-V                | Go to line (prompt)                                 |
 | F12, Ctrl-]           | Go to definition — direct escape hatch              |
 
 LSP-backed features (diagnostics on the status bar, go-to-definition, hover,
@@ -110,6 +118,7 @@ They stay dark otherwise — the editor falls back to plain text editing.
 
 | Key       | Action                                          |
 | --------- | ----------------------------------------------- |
+| Ctrl-V    | Toggle View (read-only) / Edit mode             |
 | Ctrl-C    | Clear current line (keep newline, cursor → col 0) |
 
 ### Tree (when focused)
