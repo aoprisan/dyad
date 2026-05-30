@@ -139,6 +139,19 @@ impl Language {
         }
     }
 
+    /// Tree-sitter query whose `@import` capture selects this language's
+    /// import declarations, for the LSP-free `scope.imports`. The node
+    /// kinds are grammar-specific: Rust `use_declaration`, Scala
+    /// `import_declaration`, Elm `import_clause`. Returns `None` for
+    /// languages with no grammar wired up.
+    pub fn import_query(self) -> Option<&'static str> {
+        match self {
+            Self::Rust => Some("(use_declaration) @import"),
+            Self::Scala => Some("(import_declaration) @import"),
+            Self::Elm => Some("(import_clause) @import"),
+        }
+    }
+
     /// Which output parser `test_runner` should apply to this language's
     /// `test_command` output. `None` exactly when `test_command` is
     /// `None`.

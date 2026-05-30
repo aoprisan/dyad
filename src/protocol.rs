@@ -154,6 +154,47 @@ pub struct InlineTask {
     pub text: String,
 }
 
+/// One import declaration found by `scope.imports`. `text` is the
+/// declaration's source verbatim; `line` is its 0-indexed start line.
+/// LSP-free — sourced from a Tree-sitter query against the cached tree.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ImportEntry {
+    pub text: String,
+    pub line: usize,
+}
+
+/// A symbol referenced by `scope.in_scope` — a flattened
+/// [`lsp::DocumentSymbol`] without its children. `kind` is the LSP
+/// `SymbolKind` integer (5 = Class, 12 = Function, …).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct SymbolRef {
+    pub name: String,
+    pub kind: u32,
+    pub range: lsp::Range,
+}
+
+/// What's visible at a point, per `scope.in_scope`. `enclosing` runs
+/// outer→inner (e.g. `mod` → `impl` → `fn`); `siblings` are the other
+/// top-level symbols in the file; `imports` are the file's import
+/// declarations. `locals` (params / `let` bindings via a Tree-sitter
+/// scope walk) is deferred — see `PLAN.md` Phase 2.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ScopeReport {
+    pub enclosing: Vec<SymbolRef>,
+    pub imports: Vec<ImportEntry>,
+    pub siblings: Vec<SymbolRef>,
+}
+
+impl SymbolRef {
+    fn from_doc_symbol(sym: &lsp::DocumentSymbol) -> Self {
+        Self {
+            name: sym.name.clone(),
+            kind: sym.kind,
+            range: sym.range,
+        }
+    }
+}
+
 /// Per-proposal failure surfaced by `proposals.accept_all`. The
 /// proposal is re-queued under a fresh id (the same way a single
 /// `proposal_accept` re-queues), so the agent can `proposals.list` to
@@ -846,6 +887,93 @@ impl ProtocolState {
         self.last_test_results.clone()
     }
 
+    // ---------- Scope ----------
+
+    /// The import declarations in `buffer_id`, via a Tree-sitter query
+    /// against the cached parse tree (LSP-free, so it works the instant
+    /// a file is open). Matches all import declarations in the file —
+    /// for Rust that includes `use`s nested inside items, which is the
+    /// honest answer to "what names are imported here". Returns `Err`
+    /// for languages with no grammar / import query.
+    pub fn scope_imports(&self, buffer_id: u64) -> Result<Vec<ImportEntry>> {
+        let entry = self.buffer_entry(buffer_id)?;
+        let language = entry
+            .language
+            .context("buffer has no recognized language; cannot list imports")?;
+        let query = language.import_query().with_context(|| {
+            format!("no import query for {}", language.display_name())
+        })?;
+        let syn = entry
+            .syntax
+            .as_ref()
+            .context("buffer has no syntax (unsupported language)")?;
+        let rope = entry.buffer.rope();
+        let mut out = Vec::new();
+        for m in syn.ast_query(rope, query)? {
+            if m.capture != "import" {
+                continue;
+            }
+            let start_char = rope.byte_to_char(m.byte_start);
+            let end_char = rope.byte_to_char(m.byte_end);
+            out.push(ImportEntry {
+                text: rope.slice(start_char..end_char).to_string(),
+                line: rope.byte_to_line(m.byte_start),
+            });
+        }
+        Ok(out)
+    }
+
+    /// What's in scope at `(line, character)`: the enclosing symbols
+    /// (outer→inner), the file's imports, and the other top-level
+    /// symbols (`siblings`). Enclosing + siblings come from LSP
+    /// `documentSymbol` (so this needs a running server); imports are
+    /// the LSP-free `scope_imports`. `locals` is deferred (see
+    /// `PLAN.md`).
+    pub fn scope_in_scope(
+        &self,
+        buffer_id: u64,
+        line: u32,
+        character: u32,
+    ) -> Result<ScopeReport> {
+        // Imports first — LSP-free, and it validates the buffer/language
+        // before we pay for an LSP round-trip.
+        let imports = self.scope_imports(buffer_id)?;
+        let (lsp, uri) = self.lsp_for_buffer(buffer_id)?;
+        let symbols = lsp.document_symbols(uri)?;
+
+        let mut enclosing = Vec::new();
+        let mut siblings = Vec::new();
+        let mut level: &[lsp::DocumentSymbol] = &symbols;
+        let mut top = true;
+        loop {
+            // The deepest symbol on this level whose range covers the
+            // point becomes the next enclosing frame; everything else at
+            // the top level is a sibling.
+            let mut enclosing_here: Option<&lsp::DocumentSymbol> = None;
+            for sym in level {
+                if range_contains(&sym.range, line, character) {
+                    enclosing_here = Some(sym);
+                } else if top {
+                    siblings.push(SymbolRef::from_doc_symbol(sym));
+                }
+            }
+            match enclosing_here {
+                Some(sym) => {
+                    enclosing.push(SymbolRef::from_doc_symbol(sym));
+                    level = &sym.children;
+                    top = false;
+                }
+                None => break,
+            }
+        }
+
+        Ok(ScopeReport {
+            enclosing,
+            imports,
+            siblings,
+        })
+    }
+
     // ---------- Inline agent tasks ----------
 
     /// Walk the workspace beneath `buffer_id` for inline agent task
@@ -1162,6 +1290,18 @@ pub(crate) fn scan_inline_tasks(root: &Path) -> Vec<InlineTask> {
     }
     hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
     hits
+}
+
+/// Does `range` cover the zero-based `(line, character)` point? Used by
+/// `scope_in_scope` to find enclosing symbols. Inclusive at both ends
+/// so a point sitting exactly on a symbol's closing brace still counts
+/// as inside it.
+fn range_contains(range: &lsp::Range, line: u32, character: u32) -> bool {
+    let after_start = line > range.start.line
+        || (line == range.start.line && character >= range.start.character);
+    let before_end = line < range.end.line
+        || (line == range.end.line && character <= range.end.character);
+    after_start && before_end
 }
 
 /// Look for `CLAUDE:` or `TODO(claude)` in a single line. Returns
@@ -1540,6 +1680,80 @@ mod tests {
         let still_queued = state.proposals_list();
         assert_eq!(still_queued.len(), 1);
         assert_ne!(still_queued[0].id, id);
+    }
+
+    #[test]
+    fn scope_imports_lists_use_declarations() {
+        let mut state = scratch_state("scope_imports");
+        let v = state.buffer_version(SOLE_BUFFER_ID).unwrap();
+        let len = text_of(&state, SOLE_BUFFER_ID).chars().count();
+        // Replace the seeded `fn hello() {}` with a file that has two
+        // top-level `use`s and a function.
+        state
+            .edit_replace_range(
+                SOLE_BUFFER_ID,
+                v,
+                CharRange { start: 0, end: len },
+                "use std::fmt;\nuse std::io::Read;\nfn main() {}\n",
+            )
+            .unwrap();
+        let imports = state.scope_imports(SOLE_BUFFER_ID).unwrap();
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].text, "use std::fmt;");
+        assert_eq!(imports[0].line, 0);
+        assert_eq!(imports[1].text, "use std::io::Read;");
+        assert_eq!(imports[1].line, 1);
+    }
+
+    #[test]
+    fn scope_imports_errors_for_unrecognized_language() {
+        let path = std::env::temp_dir()
+            .join(format!("dyad_scope_unknown_{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let state = ProtocolState::open(path).unwrap();
+        let err = state.scope_imports(SOLE_BUFFER_ID).unwrap_err();
+        assert!(
+            err.to_string().contains("recognized language"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn range_contains_is_inclusive_and_line_aware() {
+        let r = lsp::Range {
+            start: lsp::Position { line: 1, character: 4 },
+            end: lsp::Position { line: 3, character: 2 },
+        };
+        // Inside on an interior line, regardless of column.
+        assert!(range_contains(&r, 2, 0));
+        // On the boundary lines, the column gates membership.
+        assert!(range_contains(&r, 1, 4));
+        assert!(!range_contains(&r, 1, 3));
+        assert!(range_contains(&r, 3, 2));
+        assert!(!range_contains(&r, 3, 3));
+        // Outside entirely.
+        assert!(!range_contains(&r, 0, 9));
+        assert!(!range_contains(&r, 4, 0));
+    }
+
+    // Live `scope.in_scope` against rust-analyzer — ignored by default
+    // (needs the binary on PATH and a workspace index). Exercises the
+    // documentSymbol enclosing/sibling walk; the LSP-free `imports` side
+    // is covered hermetically above.
+    #[test]
+    #[ignore = "requires rust-analyzer + workspace index; run explicitly"]
+    fn scope_in_scope_reports_enclosing_function() {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+        let state = ProtocolState::open(manifest).unwrap();
+        // Give the server a moment to index before asking for symbols.
+        let _ = state.diag_wait_until_idle(SOLE_BUFFER_ID, Duration::from_secs(30));
+        let report = state.scope_in_scope(SOLE_BUFFER_ID, 0, 0).unwrap();
+        // main.rs has top-level items; at the very top we should see them
+        // as siblings (or one as enclosing if it spans line 0).
+        assert!(
+            !report.siblings.is_empty() || !report.enclosing.is_empty(),
+            "expected some document symbols from main.rs",
+        );
     }
 
     #[test]

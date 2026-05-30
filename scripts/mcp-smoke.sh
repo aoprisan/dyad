@@ -57,6 +57,9 @@ RESPONSES="$(
     echo '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"test.run","arguments":{"buffer_id":3,"target":"zzz_dyad_smoke_no_such_test"}}}'
     # test.last_results now reflects the cached run.
     echo '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"test.last_results","arguments":{}}}'
+    # scope.imports against the .rs buffer (LSP-free tree-sitter query).
+    # src/main.rs opens with `use std::path::PathBuf;`.
+    echo '{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"scope.imports","arguments":{"buffer_id":3}}}'
   } | "$BIN" --mcp "$FIXTURE"
 )"
 
@@ -111,6 +114,8 @@ assert_contains 2 '"name":"symbol.references"'
 assert_contains 2 '"name":"symbol.hover"'
 assert_contains 2 '"name":"test.run"'
 assert_contains 2 '"name":"test.last_results"'
+assert_contains 2 '"name":"scope.imports"'
+assert_contains 2 '"name":"scope.in_scope"'
 assert_contains 3 'fn hello() {}'
 # id=4's payload is a JSON-stringified array inside an MCP text content
 # item, so quotes are backslash-escaped on the wire — match that form.
@@ -135,5 +140,8 @@ assert_contains 15 '"isError":false'
 assert_contains 15 '\"failed\":0'
 # The cache now carries the run (exit_ok field present).
 assert_contains 16 '\"exit_ok\":'
+# scope.imports finds the leading `use std::path::PathBuf;` in main.rs.
+assert_contains 17 '"isError":false'
+assert_contains 17 'use std::path::PathBuf;'
 
 echo "PASS: mcp-smoke"

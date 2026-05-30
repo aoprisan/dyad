@@ -25,12 +25,14 @@ spec'd" means it would help agents but isn't in the design doc yet.
   human summary + `---- <name> stdout ----` failure blocks parsed in
   `test_runner.rs`. Result cached for `test.last_results`. Smoke runs a
   filtered live `cargo test`.
+- `scope.imports` / `scope.in_scope` — `DESIGN.md` "the unlock" (line
+  68). `scope.imports` is an LSP-free tree-sitter query (`@import`
+  capture per `Language::import_query`); `scope.in_scope` layers LSP
+  `documentSymbol` for `enclosing` (outer→inner) + `siblings` on top.
+  `locals` (Tree-sitter scope walk) deferred — see `PLAN.md`.
 
 ## High leverage, medium effort
 
-- `scope.in_scope` / `scope.imports` — `DESIGN.md` calls this "the
-  unlock" (line 68). Combine LSP `documentSymbol` + Tree-sitter scope
-  walking.
 - `ast.node_at(buffer, position)` — single-node lookup by point;
   infra is in `syntax.rs`.
 - Workspace navigation (not spec'd in `DESIGN.md`):

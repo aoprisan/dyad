@@ -231,6 +231,18 @@ Known scope limits in this iteration:
   runner wired up yet and bail cleanly. The parser is unit-tested; the
   live run is `#[ignore]`-gated (running `cargo test` from inside
   `cargo test` would recurse) and exercised by `scripts/mcp-smoke.sh`.
+- `scope.imports` / `scope.in_scope` answer "what's visible here".
+  `scope.imports` is LSP-free — a Tree-sitter `@import` query
+  (`Language::import_query`, covering Rust `use_declaration`, Scala
+  `import_declaration`, Elm `import_clause`) against the cached tree, so
+  it works the instant a file opens. `scope.in_scope` adds `enclosing`
+  (outer→inner: mod → impl → fn) and `siblings` (other top-level items)
+  from LSP `textDocument/documentSymbol`, normalizing both the
+  hierarchical `DocumentSymbol[]` and flat `SymbolInformation[]`
+  response shapes. It therefore needs a running server, while
+  `scope.imports` does not. `locals` (params / `let` bindings via a
+  Tree-sitter scope walk) is the deferred piece — imports + enclosing +
+  siblings ship first (see `PLAN.md` Phase 2).
 - Phase 10 ships the protocol surface for proposals
   (`edit.propose_range`, `proposals.list`, `proposals.accept`,
   `proposals.reject`). Accept runs the deferred edit through the same

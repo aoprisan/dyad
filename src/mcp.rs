@@ -184,6 +184,22 @@ fn tools_list_result() -> Value {
                 "required": [],
                 "properties": {},
             })),
+            tool_def("scope.imports", "List the import declarations in a buffer via a tree-sitter query against the cached parse tree (LSP-free). Returns [{text, line}] — `text` is the declaration's source, `line` is 0-indexed. Errors for languages with no grammar.", json!({
+                "type": "object",
+                "required": ["buffer_id"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                },
+            })),
+            tool_def("scope.in_scope", "What's visible at a zero-based (line, character): {enclosing, imports, siblings}. `enclosing` runs outer->inner (mod > impl > fn) and `siblings` are the other top-level symbols, both from LSP documentSymbol (needs a running server). `imports` is the LSP-free scope.imports. `locals` is not included yet.", json!({
+                "type": "object",
+                "required": ["buffer_id", "line", "character"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                    "line":      {"type": "integer", "minimum": 0},
+                    "character": {"type": "integer", "minimum": 0},
+                },
+            })),
             tool_def("edit.propose_range", "Queue an `edit.replace_range` for review instead of applying it. Returns a proposal_id. The reviewer (eventually a human at the TUI) accepts or rejects via the `proposals.*` tools.", json!({
                 "type": "object",
                 "required": ["buffer_id", "version", "range", "text", "intent"],
@@ -531,6 +547,24 @@ fn dispatch_tool(
             Ok(json!(state.test_run(a.buffer_id, a.target.as_deref())?))
         }
         "test.last_results" => Ok(json!(state.test_last_results())),
+        "scope.imports" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            Ok(json!(state.scope_imports(a.buffer_id)?))
+        }
+        "scope.in_scope" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+                line: u32,
+                character: u32,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            Ok(json!(state.scope_in_scope(a.buffer_id, a.line, a.character)?))
+        }
         "edit.propose_range" => {
             #[derive(Deserialize)]
             struct Args {
@@ -906,6 +940,8 @@ mod tests {
             "git.commit",
             "test.run",
             "test.last_results",
+            "scope.imports",
+            "scope.in_scope",
             "edit.propose_range",
             "proposals.list",
             "proposals.accept",

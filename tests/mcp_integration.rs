@@ -272,6 +272,24 @@ fn ast_query_finds_function_names_through_jsonrpc() {
 }
 
 #[test]
+fn scope_imports_lists_use_declarations_through_jsonrpc() {
+    let mut s = McpSession::start(
+        "use std::fmt;\nuse std::io::Read;\nfn main() {}\n",
+        "scope_imports",
+    );
+    let _ = s.call(1, "initialize", json!({}));
+    let resp = s.call_tool(2, "scope.imports", json!({ "buffer_id": 1 }));
+    assert_eq!(resp["result"]["isError"], false);
+    let imports = tool_payload(&resp);
+    let arr = imports.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["text"], "use std::fmt;");
+    assert_eq!(arr[0]["line"], 0);
+    assert_eq!(arr[1]["text"], "use std::io::Read;");
+    assert_eq!(arr[1]["line"], 1);
+}
+
+#[test]
 fn transaction_commit_collapses_multiple_edits_into_one_history_entry() {
     let mut s = McpSession::start("", "tx");
     let _ = s.call(1, "initialize", json!({}));

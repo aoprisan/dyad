@@ -35,13 +35,13 @@ use serde_json::{Value, json};
 
 use crate::language::Language;
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Position {
     pub line: u32,
     pub character: u32,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Range {
     pub start: Position,
     pub end: Position,
@@ -93,6 +93,21 @@ pub struct SymbolInformation {
     pub location: Location,
     #[serde(rename = "containerName", default)]
     pub container_name: Option<String>,
+}
+
+/// Normalized `textDocument/documentSymbol` entry. LSP defines two
+/// response shapes — hierarchical `DocumentSymbol[]` (nested, with a
+/// full `range` plus a name-only `selectionRange`) and the older flat
+/// `SymbolInformation[]` (each carrying a `location`). We collapse both
+/// to this: `range` is the symbol's full extent (so callers can test
+/// enclosure of a point), and `children` is empty for the flat variant.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DocumentSymbol {
+    pub name: String,
+    pub kind: u32,
+    pub range: Range,
+    #[serde(default)]
+    pub children: Vec<DocumentSymbol>,
 }
 
 struct LspState {
@@ -210,6 +225,7 @@ impl LspClient {
             "textDocument": {
                 "publishDiagnostics": { "relatedInformation": false },
                 "definition": { "linkSupport": false },
+                "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
                 "hover": {},
                 "synchronization": {
                     "didSave": false,
@@ -380,6 +396,19 @@ impl LspClient {
         }
     }
 
+    /// `textDocument/documentSymbol` for `uri`, normalized to
+    /// [`DocumentSymbol`] regardless of which of the two LSP response
+    /// shapes the server returned. Backs `scope.in_scope`'s enclosing /
+    /// sibling computation.
+    pub fn document_symbols(&self, uri: &str) -> Result<Vec<DocumentSymbol>> {
+        let result = self.request(
+            "textDocument/documentSymbol",
+            json!({ "textDocument": { "uri": uri } }),
+            Duration::from_secs(10),
+        )?;
+        parse_document_symbols(result)
+    }
+
     /// Ask the server for the workspace edits required to rename the
     /// symbol at the given position to `new_name`. Returns the raw
     /// `WorkspaceEdit`; the caller applies the in-buffer subset and
@@ -521,6 +550,40 @@ impl LspClient {
 
     fn send(&self, msg: &Value) -> Result<()> {
         write_message(&self.stdin, msg)
+    }
+}
+
+/// Normalize a `textDocument/documentSymbol` response into
+/// [`DocumentSymbol`]s. The server may return either the hierarchical
+/// `DocumentSymbol[]` form or the flat `SymbolInformation[]` form; we
+/// detect which by whether the first element carries a `location`
+/// (flat) versus a `range` (hierarchical). `null` / empty / unexpected
+/// shapes map to an empty list. Pulled out as a free function so it can
+/// be unit-tested without a live server.
+fn parse_document_symbols(result: Value) -> Result<Vec<DocumentSymbol>> {
+    let arr = match result {
+        Value::Array(a) => a,
+        _ => return Ok(Vec::new()),
+    };
+    let Some(first) = arr.first() else {
+        return Ok(Vec::new());
+    };
+    if first.get("location").is_some() {
+        // Flat `SymbolInformation[]`: lift each `location.range` up and
+        // drop container nesting (callers that need hierarchy get it
+        // from the hierarchical variant, which rust-analyzer returns).
+        let flat: Vec<SymbolInformation> = serde_json::from_value(Value::Array(arr))?;
+        Ok(flat
+            .into_iter()
+            .map(|s| DocumentSymbol {
+                name: s.name,
+                kind: s.kind,
+                range: s.location.range,
+                children: Vec::new(),
+            })
+            .collect())
+    } else {
+        Ok(serde_json::from_value(Value::Array(arr))?)
     }
 }
 
@@ -864,6 +927,58 @@ mod tests {
         let mut reader = Cursor::new(bytes);
         let msg = read_message(&mut reader).unwrap().unwrap();
         assert_eq!(msg["id"], 7);
+    }
+
+    #[test]
+    fn parse_document_symbols_handles_hierarchical_variant() {
+        let result = json!([
+            {
+                "name": "outer",
+                "kind": 12,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 1}},
+                "selectionRange": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 8}},
+                "children": [
+                    {
+                        "name": "inner",
+                        "kind": 12,
+                        "range": {"start": {"line": 1, "character": 4}, "end": {"line": 3, "character": 5}},
+                        "selectionRange": {"start": {"line": 1, "character": 7}, "end": {"line": 1, "character": 12}}
+                    }
+                ]
+            }
+        ]);
+        let syms = parse_document_symbols(result).unwrap();
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "outer");
+        assert_eq!(syms[0].range.end.line, 5);
+        assert_eq!(syms[0].children.len(), 1);
+        assert_eq!(syms[0].children[0].name, "inner");
+    }
+
+    #[test]
+    fn parse_document_symbols_handles_flat_variant() {
+        // Flat `SymbolInformation[]`: `location` present, no nesting.
+        let result = json!([
+            {
+                "name": "Thing",
+                "kind": 5,
+                "location": {
+                    "uri": "file:///x.rs",
+                    "range": {"start": {"line": 2, "character": 0}, "end": {"line": 4, "character": 1}}
+                }
+            }
+        ]);
+        let syms = parse_document_symbols(result).unwrap();
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "Thing");
+        assert_eq!(syms[0].range.start.line, 2);
+        assert!(syms[0].children.is_empty());
+    }
+
+    #[test]
+    fn parse_document_symbols_maps_null_and_empty_to_empty() {
+        assert!(parse_document_symbols(Value::Null).unwrap().is_empty());
+        assert!(parse_document_symbols(json!([])).unwrap().is_empty());
     }
 
     #[test]

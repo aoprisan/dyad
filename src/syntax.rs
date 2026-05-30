@@ -554,4 +554,49 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["farewell".to_string()]);
     }
+
+    /// Each language's `import_query` (from the `Language` registry)
+    /// must compile against its grammar and capture a real import on a
+    /// minimal sample. This is the guard that the grammar-specific node
+    /// kinds (`use_declaration` / `import_declaration` / `import_clause`)
+    /// are spelled correctly — a wrong kind would only surface as a
+    /// runtime `scope.imports` error otherwise.
+    #[test]
+    fn import_query_matches_each_languages_imports() {
+        use crate::language::Language;
+
+        let cases = [
+            (Language::Rust, Syntax::rust().unwrap(), "use std::fmt;\nfn main() {}\n", "use std::fmt;"),
+            (
+                Language::Scala,
+                Syntax::scala().unwrap(),
+                "import scala.collection.mutable\nobject M\n",
+                "import scala.collection.mutable",
+            ),
+            (
+                Language::Elm,
+                Syntax::elm().unwrap(),
+                "module Main exposing (main)\n\nimport Html exposing (text)\n\nmain = text\n",
+                "import Html exposing (text)",
+            ),
+        ];
+
+        for (lang, mut syn, src, expected) in cases {
+            let mut buf = scratch_buffer(lang.display_name());
+            buf.insert_str(0, src);
+            syn.refresh(&mut buf);
+            let query = lang.import_query().expect("language has an import query");
+            let hits: Vec<String> = syn
+                .ast_query(buf.rope(), query)
+                .unwrap_or_else(|e| panic!("{lang:?} import query failed to compile: {e}"))
+                .into_iter()
+                .filter(|m| m.capture == "import")
+                .map(|m| slice(buf.rope(), m.byte_start, m.byte_end))
+                .collect();
+            assert!(
+                hits.iter().any(|h| h.trim() == expected),
+                "{lang:?}: expected an import matching {expected:?}, got {hits:?}",
+            );
+        }
+    }
 }
