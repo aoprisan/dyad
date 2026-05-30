@@ -26,6 +26,7 @@ use crate::language::Language;
 use crate::lsp::{self, Diagnostic, Location, LspClient, SymbolInformation, TextEdit};
 use crate::proposals::{PendingProposal, Proposal, ProposalId, ProposalKind, ProposalQueue};
 use crate::syntax::{AstMatch, Syntax};
+use crate::test_runner::{self, TestResults};
 use crate::tx::{Change, ChangeId, TxId, TxManager};
 
 /// The first buffer always gets this id, so back-compat with the
@@ -58,6 +59,10 @@ pub struct ProtocolState {
     client_id: String,
     /// Phase 10 — agent-submitted edits awaiting accept/reject.
     proposals: ProposalQueue,
+    /// Most recent `test.run` outcome, served by `test.last_results` so
+    /// an agent (or a second client) can read the last verification
+    /// without re-running the suite.
+    last_test_results: Option<TestResults>,
 }
 
 struct BufferEntry {
@@ -179,6 +184,7 @@ impl ProtocolState {
             workspace_roots: HashMap::new(),
             client_id: format!("mcp-{}", std::process::id()),
             proposals: ProposalQueue::new(),
+            last_test_results: None,
         };
         state.buffer_open(path)?;
         Ok(state)
@@ -799,6 +805,45 @@ impl ProtocolState {
     pub fn git_commit(&self, buffer_id: u64, message: &str) -> Result<String> {
         let repo_root = self.repo_root_for_buffer(buffer_id)?;
         git::commit(&repo_root, message)
+    }
+
+    // ---------- Tests ----------
+
+    /// Run the buffer language's test suite (Rust → `cargo test`) with
+    /// the language workspace root as the working directory, optionally
+    /// filtered by `target` (a libtest name substring for cargo). The
+    /// result is cached for `test_last_results`. Returns `Err` only when
+    /// the language has no runner wired up, the buffer has no path, or
+    /// the process can't be spawned — a test *failure* comes back as a
+    /// successful call with `exit_ok: false`.
+    pub fn test_run(&mut self, buffer_id: u64, target: Option<&str>) -> Result<TestResults> {
+        let entry = self.buffer_entry(buffer_id)?;
+        let path = entry
+            .buffer
+            .path()
+            .context("buffer has no path; cannot locate a test workspace")?;
+        let language = entry
+            .language
+            .context("buffer language is unknown; cannot run tests")?;
+        let cmd = language.test_command();
+        let kind = language.test_runner_kind();
+        let (Some(cmd), Some(kind)) = (cmd, kind) else {
+            return Err(anyhow!(
+                "no test runner configured for {}",
+                language.display_name()
+            ));
+        };
+        let root = lsp::workspace_root_for(path, language);
+        let results = test_runner::run(&root, cmd, kind, target)?;
+        self.last_test_results = Some(results.clone());
+        Ok(results)
+    }
+
+    /// The most recent `test_run` outcome, or `None` if no run has
+    /// happened this session. Lets a second client read the last
+    /// verification without paying to re-run the suite.
+    pub fn test_last_results(&self) -> Option<TestResults> {
+        self.last_test_results.clone()
     }
 
     // ---------- Inline agent tasks ----------
@@ -1517,6 +1562,48 @@ mod tests {
                 || msg.contains("no recognized"),
             "unexpected error: {msg}",
         );
+    }
+
+    #[test]
+    fn test_last_results_empty_until_a_run_happens() {
+        let state = scratch_state("test_cache");
+        assert!(state.test_last_results().is_none());
+    }
+
+    #[test]
+    fn test_run_errors_for_unrecognized_language() {
+        // A .txt buffer has no `Language`, so there's no runner to pick.
+        let path = std::env::temp_dir()
+            .join(format!("dyad_test_run_unknown_{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut state = ProtocolState::open(path).unwrap();
+        let err = state.test_run(SOLE_BUFFER_ID, None).unwrap_err();
+        assert!(
+            err.to_string().contains("language is unknown"),
+            "unexpected error: {err}",
+        );
+    }
+
+    // Live `cargo test` run — ignored by default because it shells out
+    // to cargo (and would recurse if pointed at this very crate). The
+    // parser is covered hermetically in `test_runner`; this just proves
+    // the protocol plumbing and the result cache against a real run.
+    // Exercised by `scripts/mcp-smoke.sh`.
+    #[test]
+    #[ignore = "spawns a live `cargo test`; run explicitly"]
+    fn test_run_populates_the_cache() {
+        // Point at this crate's manifest dir so cargo has a workspace.
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/main.rs");
+        let mut state = ProtocolState::open(manifest).unwrap();
+        assert!(state.test_last_results().is_none());
+        let results = state
+            .test_run(SOLE_BUFFER_ID, Some("parse_summary_line_unreachable_filter"))
+            .unwrap();
+        // The filter matches nothing, so zero tests run but the call
+        // still succeeds and caches.
+        assert_eq!(results.failed, 0);
+        assert!(state.test_last_results().is_some());
     }
 
     #[test]

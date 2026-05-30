@@ -17,6 +17,16 @@ pub enum Language {
     Elm,
 }
 
+/// Selects the output parser `test_runner` uses for a language's test
+/// command. Each variant names a stable textual format we know how to
+/// scrape — `CargoTest` is libtest's human summary (`test result: ok.
+/// N passed; …` plus the `failures:` blocks). New runners (e.g. an sbt
+/// or elm-test parser) get their own variant alongside `test_command`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestRunnerKind {
+    CargoTest,
+}
+
 impl Language {
     /// Pick a language from a file path's extension. Returns `None` for
     /// paths we don't recognize — the caller falls back to plain text.
@@ -114,6 +124,31 @@ impl Language {
         }
     }
 
+    /// Argv for running this language's test suite, run with the
+    /// workspace root as the working directory (cargo has no `-C`, so
+    /// `test_runner` sets `current_dir`). Returns `None` for languages
+    /// without a wired-up runner yet — `test.run` bails cleanly rather
+    /// than guessing. A `target` filter, when supplied, is appended by
+    /// the caller.
+    pub fn test_command(self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::Rust => Some(&["cargo", "test"]),
+            // No agreed-on machine-parseable runner wired up yet; bail
+            // cleanly rather than shell out to the wrong tool.
+            Self::Scala | Self::Elm => None,
+        }
+    }
+
+    /// Which output parser `test_runner` should apply to this language's
+    /// `test_command` output. `None` exactly when `test_command` is
+    /// `None`.
+    pub fn test_runner_kind(self) -> Option<TestRunnerKind> {
+        match self {
+            Self::Rust => Some(TestRunnerKind::CargoTest),
+            Self::Scala | Self::Elm => None,
+        }
+    }
+
     /// `initializationOptions` payload merged into the initialize params.
     /// Returns `None` to omit the field entirely.
     pub fn initialization_options(self) -> Option<Value> {
@@ -200,6 +235,26 @@ mod tests {
         assert!(Language::Rust.supports_type_from_source_line());
         assert!(!Language::Scala.supports_type_from_source_line());
         assert!(!Language::Elm.supports_type_from_source_line());
+    }
+
+    #[test]
+    fn test_command_wired_for_rust_only() {
+        assert_eq!(Language::Rust.test_command(), Some(&["cargo", "test"][..]));
+        assert!(Language::Scala.test_command().is_none());
+        assert!(Language::Elm.test_command().is_none());
+
+        // The parser selector tracks command availability exactly.
+        assert_eq!(
+            Language::Rust.test_runner_kind(),
+            Some(TestRunnerKind::CargoTest)
+        );
+        for lang in [Language::Rust, Language::Scala, Language::Elm] {
+            assert_eq!(
+                lang.test_command().is_some(),
+                lang.test_runner_kind().is_some(),
+                "{lang:?}: command and parser availability must agree"
+            );
+        }
     }
 
     #[test]

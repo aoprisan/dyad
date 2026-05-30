@@ -20,6 +20,11 @@ spec'd" means it would help agents but isn't in the design doc yet.
   `symbol.signature` slot; same endpoint, agent slices the body).
 - `buffer.version(id)` — thin wrapper exposing `Buffer::version`.
 - `proposals.count` — wrapper over `ProposalQueue::count()`.
+- `test.run(target?)` / `test.last_results` (`DESIGN.md` 121-123) —
+  closes the agent edit→verify loop. Rust → `cargo test`; libtest's
+  human summary + `---- <name> stdout ----` failure blocks parsed in
+  `test_runner.rs`. Result cached for `test.last_results`. Smoke runs a
+  filtered live `cargo test`.
 
 ## High leverage, medium effort
 
@@ -37,8 +42,6 @@ spec'd" means it would help agents but isn't in the design doc yet.
 
 ## Spec'd but never started
 
-- `test.run(target?)` / `test.last_results` (`DESIGN.md` 121-123) —
-  completes the agent validation loop.
 - `diag.subscribe` — push diagnostics instead of poll.
 - `history.diff(change_id)` / `history.replay(change_id, target)` /
   `history.tree(buffer_id)` — replay is the unique-to-dyad pitch.

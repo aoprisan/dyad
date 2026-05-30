@@ -27,6 +27,7 @@ fi
 # binary, capture all output, then assert on individual responses by
 # their JSON-RPC `id`.
 REPO_FILE="${ROOT}/Cargo.toml"
+REPO_RS="${ROOT}/src/main.rs"
 RESPONSES="$(
   {
     echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
@@ -45,6 +46,17 @@ RESPONSES="$(
     # buffer.version reports the post-edit version (>0 after the id=5 replace).
     echo '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"buffer.version","arguments":{"buffer_id":1}}}'
     echo '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"proposals.count","arguments":{}}}'
+    # test.last_results is null before any run this session.
+    echo '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"test.last_results","arguments":{}}}'
+    # Open a real .rs file in the repo (buffer 3) so test.run can resolve
+    # a Rust workspace and runner — Cargo.toml itself has no Language.
+    printf '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"buffer.open","arguments":{"path":"%s"}}}\n' "$REPO_RS"
+    # test.run against that buffer with a target filter that matches
+    # nothing, so the suite runs fast and green. Proves the edit→verify
+    # loop end-to-end.
+    echo '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"test.run","arguments":{"buffer_id":3,"target":"zzz_dyad_smoke_no_such_test"}}}'
+    # test.last_results now reflects the cached run.
+    echo '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"test.last_results","arguments":{}}}'
   } | "$BIN" --mcp "$FIXTURE"
 )"
 
@@ -97,6 +109,8 @@ assert_contains 2 '"name":"proposals.count"'
 assert_contains 2 '"name":"buffer.version"'
 assert_contains 2 '"name":"symbol.references"'
 assert_contains 2 '"name":"symbol.hover"'
+assert_contains 2 '"name":"test.run"'
+assert_contains 2 '"name":"test.last_results"'
 assert_contains 3 'fn hello() {}'
 # id=4's payload is a JSON-stringified array inside an MCP text content
 # item, so quotes are backslash-escaped on the wire — match that form.
@@ -112,5 +126,14 @@ assert_contains 11 '"isError":false'
 assert_contains 11 '\"version\":'
 # Empty proposals queue.
 assert_contains 12 '\"count\":0'
+# No run yet → test.last_results returns JSON null.
+assert_contains 13 'null'
+# buffer.open of the .rs file returns buffer 3.
+assert_contains 14 '\"buffer_id\":3'
+# A filtered run that matches nothing still succeeds: zero failures.
+assert_contains 15 '"isError":false'
+assert_contains 15 '\"failed\":0'
+# The cache now carries the run (exit_ok field present).
+assert_contains 16 '\"exit_ok\":'
 
 echo "PASS: mcp-smoke"

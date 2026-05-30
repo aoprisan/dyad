@@ -157,11 +157,8 @@ impl FileTree {
         let path = self.entries[idx].path.clone();
         let children = list_dir(&path, depth + 1);
         self.entries[idx].expanded = true;
-        let mut insert_at = idx + 1;
-        for child in children {
-            self.entries.insert(insert_at, child);
-            insert_at += 1;
-        }
+        let insert_at = idx + 1;
+        self.entries.splice(insert_at..insert_at, children);
     }
 
     fn collapse_at(&mut self, idx: usize) {

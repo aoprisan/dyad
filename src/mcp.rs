@@ -171,6 +171,19 @@ fn tools_list_result() -> Value {
                     "message":   {"type": "string"},
                 },
             })),
+            tool_def("test.run", "Run the buffer language's test suite (Rust → `cargo test`) from the workspace root, optionally filtered by `target` (a libtest name substring for cargo). Returns {passed, failed, ignored, failures: [{name, message}], exit_ok, raw_tail}. A test failure is a successful call with exit_ok=false; errors only for missing path / unsupported language / un-spawnable process. Caches the result for test.last_results.", json!({
+                "type": "object",
+                "required": ["buffer_id"],
+                "properties": {
+                    "buffer_id": {"type": "integer"},
+                    "target":    {"type": "string"},
+                },
+            })),
+            tool_def("test.last_results", "Return the most recent test.run outcome ({passed, failed, ignored, failures, exit_ok, raw_tail}) or null if no run has happened this session. Lets a second client read the last verification without re-running the suite.", json!({
+                "type": "object",
+                "required": [],
+                "properties": {},
+            })),
             tool_def("edit.propose_range", "Queue an `edit.replace_range` for review instead of applying it. Returns a proposal_id. The reviewer (eventually a human at the TUI) accepts or rejects via the `proposals.*` tools.", json!({
                 "type": "object",
                 "required": ["buffer_id", "version", "range", "text", "intent"],
@@ -508,6 +521,16 @@ fn dispatch_tool(
             let output = state.git_commit(a.buffer_id, &a.message)?;
             Ok(json!({ "output": output }))
         }
+        "test.run" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+                target: Option<String>,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            Ok(json!(state.test_run(a.buffer_id, a.target.as_deref())?))
+        }
+        "test.last_results" => Ok(json!(state.test_last_results())),
         "edit.propose_range" => {
             #[derive(Deserialize)]
             struct Args {
@@ -881,6 +904,8 @@ mod tests {
             "git.stage",
             "git.unstage",
             "git.commit",
+            "test.run",
+            "test.last_results",
             "edit.propose_range",
             "proposals.list",
             "proposals.accept",

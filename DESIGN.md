@@ -218,6 +218,19 @@ Known scope limits in this iteration:
   patch. Both shell out to `git`; agents and humans see whatever the
   on-disk file says — unsaved buffer changes don't yet feed into the
   diff (would need a temp-file or in-process diff algorithm).
+- `test.run` closes the edit→verify loop: it shells out to the buffer
+  language's runner (Rust → `cargo test`, run from the language
+  workspace root since cargo has no `-C`) with an optional `target`
+  name filter, and scrapes libtest's stable human summary — counts plus
+  `---- <name> stdout ----` failure blocks — into
+  `{passed, failed, ignored, failures, exit_ok, raw_tail}`. A test
+  *failure* is a successful call with `exit_ok: false`; only a missing
+  path, an unsupported language, or an un-spawnable process error out.
+  `raw_tail` is capped (~4KB) so a noisy build can't balloon the
+  response. The result caches for `test.last_results`. Scala/Elm have no
+  runner wired up yet and bail cleanly. The parser is unit-tested; the
+  live run is `#[ignore]`-gated (running `cargo test` from inside
+  `cargo test` would recurse) and exercised by `scripts/mcp-smoke.sh`.
 - Phase 10 ships the protocol surface for proposals
   (`edit.propose_range`, `proposals.list`, `proposals.accept`,
   `proposals.reject`). Accept runs the deferred edit through the same

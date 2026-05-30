@@ -16,6 +16,7 @@ mod proposals;
 mod protocol;
 mod syntax;
 mod terminal;
+mod test_runner;
 mod theme;
 mod tree;
 mod tx;

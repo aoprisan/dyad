@@ -946,10 +946,8 @@ impl App {
                 }
             }
             Action::MoveHome => view.cursor = 0,
-            Action::MoveEnd => {
-                if !view.matches.is_empty() {
-                    view.cursor = view.matches.len() - 1;
-                }
+            Action::MoveEnd if !view.matches.is_empty() => {
+                view.cursor = view.matches.len() - 1;
             }
             // Other input (arrows in-line, etc.) is swallowed — the
             // dialog is its own little world.
@@ -1028,10 +1026,8 @@ impl App {
                 }
             }
             Action::MoveHome => view.cursor = 0,
-            Action::MoveEnd => {
-                if !view.results.is_empty() {
-                    view.cursor = view.results.len() - 1;
-                }
+            Action::MoveEnd if !view.results.is_empty() => {
+                view.cursor = view.results.len() - 1;
             }
             _ => {}
         }
@@ -1160,10 +1156,8 @@ impl App {
                 }
             }
             Action::MoveHome => view.cursor = 0,
-            Action::MoveEnd => {
-                if !view.results.is_empty() {
-                    view.cursor = view.results.len() - 1;
-                }
+            Action::MoveEnd if !view.results.is_empty() => {
+                view.cursor = view.results.len() - 1;
             }
             _ => {}
         }

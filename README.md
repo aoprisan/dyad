@@ -31,7 +31,7 @@ the MCP protocol surface. The TUI is exercised manually.
 ```bash
 cargo run -- path/to/file        # open in the TUI (created on save if missing)
 cargo run -- path/to/file --mcp  # run as an MCP server over stdio (JSON-RPC 2.0, line-delimited)
-cargo run -- --install           # symlink the release binary into ~/.local/bin
+cargo run -- --install           # copy the release binary into ~/.local/bin
 ```
 
 Build and lint:
@@ -176,6 +176,7 @@ The current surface (`tools/list` over `--mcp`):
 | `diag.current`                | Cached LSP diagnostics for a buffer.                                                   |
 | `diag.wait_until_idle`        | Block until the LSP has published diagnostics for the latest sync (edit-then-verify).  |
 | `tasks.list`                  | Scan the workspace for inline `// CLAUDE: …` / `// TODO(claude): …` markers.           |
+| `test.run` / `.last_results`  | Run the buffer language's tests (Rust → `cargo test`, optional `target` filter); returns `{passed, failed, ignored, failures, exit_ok, raw_tail}` and caches the last run. |
 | `git.diff` / `.status` / `.log` / `.show` / `.stage` / `.unstage` / `.commit` | Git plumbing scoped to the buffer's repo. |
 | `clients.list`                | Active clients (currently the MCP session — TUI presence is a follow-up).              |
 
