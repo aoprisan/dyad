@@ -6,6 +6,7 @@ use clap::Parser;
 mod action;
 mod app;
 mod buffer;
+mod core;
 mod git;
 mod input;
 mod install;

@@ -78,10 +78,22 @@ the "symmetric clients" invariant from `DESIGN.md`.
   (git diff, history, fuzzy open, keys help). `App::apply(Action)` is the
   **single TUI mutation funnel** — every keystroke that touches state goes
   through it, wrapped in an auto-transaction with a synthetic intent string.
-- `protocol.rs` — `ProtocolState`: the agent-facing surface. Methods are
+- `core.rs` — `EditorCore`: the shared editor-as-runtime state (the buffer
+  map + `BufferEntry`, `TxManager`, per-language `LspClient`s, the proposal
+  queue, last test results) plus all the editing/query logic. Lives behind
+  `Arc<Mutex<…>>` so it can be the single owner both the TUI (`App`) and the
+  agent surface (`ProtocolState`) become *views* over — the Phase 4 daemon
+  split (`PLAN.md`). Today exactly one client drives a given core at a time;
+  `focus`/`explicit_tx` ride along here until real multi-client lands. **App
+  does not yet share this core** — that's the next step of Phase 4.
+- `protocol.rs` — `ProtocolState`: the agent-facing *view* over an
+  `Arc<Mutex<EditorCore>>` (plus the per-client `client_id`). Each method is
   one-per-`DESIGN.md`-verb (`buffer_open`, `buffer_read`, `ast_query`,
   `edit_replace_range`, `edit_replace_node`, `edit_rename_symbol`, `tx_begin`,
-  `tx_commit`, `history_recent`, `git_diff`, `edit_propose_range`, …). The
+  `tx_commit`, `history_recent`, `git_diff`, `edit_propose_range`, …) and
+  thinly forwards to the locked core. The protocol DTOs and free helpers
+  (`apply_text_edits`, `lsp_pos_to_char`, the context-pack geometry) stay
+  here — they're the protocol's public vocabulary, shared with `core.rs`. The
   TUI does **not** route through `ProtocolState` today — `App` calls
   `Buffer`/`TxManager` directly. Keep the two surfaces semantically aligned.
 - `mcp.rs` — JSON-RPC 2.0 stdio transport. One tool per `ProtocolState`
