@@ -26,7 +26,7 @@ with the TUI.
 cargo build                                 # build
 cargo run -- <path>                         # open <path> in the TUI (created on save if missing)
 cargo run -- <path> --mcp                   # run as an MCP server over stdio (JSON-RPC 2.0, line-delimited)
-cargo run -- --install                      # symlink the built binary into ~/.local/bin
+cargo build --release && ./target/release/dyad --install   # copy the binary into ~/.local/bin (build release first — copies a snapshot)
 cargo clippy --all-targets -- -D warnings   # lint (must stay clean)
 
 cargo test                                  # unit tests in src/ + integration tests in tests/
@@ -126,9 +126,11 @@ the "symmetric clients" invariant from `DESIGN.md`.
 - `terminal.rs` — RAII `Guard` around `ratatui::try_init`/`restore`. The
   `try_init` call installs a panic hook that restores the terminal before the
   panic message prints.
-- `install.rs` — `dyad --install`: symlinks the current binary into
-  `~/.local/bin`. Refuses to overwrite anything that isn't already a symlink,
-  so it won't clobber a user-owned file.
+- `install.rs` — `dyad --install`: copies the current binary into
+  `~/.local/bin` (a standalone snapshot, so a later `cargo build --release`
+  no longer updates it in place — re-run `--install` to refresh). Replaces a
+  prior copy or old-style symlink, refuses to overwrite a directory, and
+  no-ops when run from the already-installed copy.
 
 ## Invariants to preserve
 
