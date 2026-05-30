@@ -93,6 +93,7 @@ impl Syntax {
         match Language::for_path(path?)? {
             Language::Rust => Self::rust().ok(),
             Language::Scala => Self::scala().ok(),
+            Language::Elm => Self::elm().ok(),
         }
     }
 
@@ -104,6 +105,11 @@ impl Syntax {
     fn scala() -> Result<Self> {
         let language: TsLanguage = tree_sitter_scala::LANGUAGE.into();
         Self::build(language, tree_sitter_scala::HIGHLIGHTS_QUERY, "scala")
+    }
+
+    fn elm() -> Result<Self> {
+        let language: TsLanguage = tree_sitter_elm::LANGUAGE.into();
+        Self::build(language, tree_sitter_elm::HIGHLIGHTS_QUERY, "elm")
     }
 
     /// Shared constructor — every grammar uses the same `HIGHLIGHT_NAMES`
@@ -495,6 +501,28 @@ mod tests {
         assert!(
             !line0.is_empty(),
             "expected at least one highlight span on the Scala source line"
+        );
+    }
+
+    fn scratch_elm_buffer(name: &str) -> Buffer {
+        let path = std::env::temp_dir()
+            .join(format!("dyad_test_{}_{}.elm", name, std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Buffer::open(path).unwrap()
+    }
+
+    /// Smoke check: highlighting runs against the Elm grammar without
+    /// blowing up and produces at least one span on a real declaration.
+    #[test]
+    fn elm_highlight_produces_spans() {
+        let mut buf = scratch_elm_buffer("highlight");
+        buf.insert_str(0, "module Main exposing (main)\n\nmain = 1\n");
+        let mut syn = Syntax::elm().unwrap();
+        syn.refresh(&mut buf);
+        let line0 = syn.line_spans(0);
+        assert!(
+            !line0.is_empty(),
+            "expected at least one highlight span on the Elm module line"
         );
     }
 

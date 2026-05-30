@@ -1,7 +1,7 @@
 //! Language registry — the single source of truth for per-language data
 //! threaded through the syntax, LSP, and protocol layers.
 //!
-//! Adding a third language is two steps: extend the enum, fill out the
+//! Adding a new language is two steps: extend the enum, fill out the
 //! descriptor methods. The match arms are exhaustive so the compiler
 //! flags every site that needs a new branch.
 
@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 pub enum Language {
     Rust,
     Scala,
+    Elm,
 }
 
 impl Language {
@@ -25,6 +26,7 @@ impl Language {
             // Metals treats .scala source, .sc worksheets, and .sbt build
             // files as first-class — all three route to the same server.
             "scala" | "sc" | "sbt" => Some(Self::Scala),
+            "elm" => Some(Self::Elm),
             _ => None,
         }
     }
@@ -34,6 +36,7 @@ impl Language {
         match self {
             Self::Rust => "rust",
             Self::Scala => "scala",
+            Self::Elm => "elm",
         }
     }
 
@@ -43,6 +46,7 @@ impl Language {
         match self {
             Self::Rust => "rust",
             Self::Scala => "scala",
+            Self::Elm => "elm",
         }
     }
 
@@ -51,6 +55,7 @@ impl Language {
         match self {
             Self::Rust => "rust-analyzer",
             Self::Scala => "metals",
+            Self::Elm => "elm-language-server",
         }
     }
 
@@ -59,6 +64,7 @@ impl Language {
         match self {
             Self::Rust => "rustup component add rust-analyzer",
             Self::Scala => "coursier install metals",
+            Self::Elm => "npm install -g @elm-tooling/elm-language-server",
         }
     }
 
@@ -73,6 +79,7 @@ impl Language {
                 "build.mill",
                 "project/build.properties",
             ],
+            Self::Elm => &["elm.json"],
         }
     }
 
@@ -103,6 +110,7 @@ impl Language {
         match self {
             Self::Rust => Duration::from_secs(30),
             Self::Scala => Duration::from_secs(60),
+            Self::Elm => Duration::from_secs(30),
         }
     }
 
@@ -118,6 +126,7 @@ impl Language {
                 // surface indexing/compiling state in the LSP badge.
                 "statusBarProvider": "on",
             })),
+            Self::Elm => None,
         }
     }
 }
@@ -141,6 +150,14 @@ mod tests {
     }
 
     #[test]
+    fn for_path_recognizes_elm_extension() {
+        assert_eq!(
+            Language::for_path(&PathBuf::from("Main.elm")),
+            Some(Language::Elm)
+        );
+    }
+
+    #[test]
     fn for_path_returns_none_for_unknown_extensions() {
         assert!(Language::for_path(&PathBuf::from("README.md")).is_none());
         assert!(Language::for_path(&PathBuf::from("noext")).is_none());
@@ -148,7 +165,7 @@ mod tests {
 
     #[test]
     fn descriptor_strings_are_stable_and_non_empty() {
-        for lang in [Language::Rust, Language::Scala] {
+        for lang in [Language::Rust, Language::Scala, Language::Elm] {
             assert!(!lang.display_name().is_empty());
             assert!(!lang.lsp_binary().is_empty());
             assert!(!lang.lsp_language_id().is_empty());
@@ -163,21 +180,26 @@ mod tests {
         assert_eq!(Language::Rust.workspace_markers(), &["Cargo.toml"]);
         let scala_markers = Language::Scala.workspace_markers();
         assert!(scala_markers.contains(&"build.sbt"));
+        assert_eq!(Language::Elm.workspace_markers(), &["elm.json"]);
     }
 
     #[test]
     fn capability_flags_match_language() {
-        // Rust advertises rust-analyzer status; Scala does not.
+        // Rust advertises rust-analyzer status; Scala and Elm do not.
         assert!(Language::Rust.advertises_rust_analyzer_server_status());
         assert!(!Language::Scala.advertises_rust_analyzer_server_status());
+        assert!(!Language::Elm.advertises_rust_analyzer_server_status());
 
-        // Both track indexing status.
+        // Rust and Scala emit indexing-status notifications we understand;
+        // elm-language-server doesn't, so we don't gate the badge on it.
         assert!(Language::Rust.tracks_indexing_status());
         assert!(Language::Scala.tracks_indexing_status());
+        assert!(!Language::Elm.tracks_indexing_status());
 
         // Only Rust has the type-from-source-line fallback.
         assert!(Language::Rust.supports_type_from_source_line());
         assert!(!Language::Scala.supports_type_from_source_line());
+        assert!(!Language::Elm.supports_type_from_source_line());
     }
 
     #[test]
@@ -186,5 +208,6 @@ mod tests {
         let opts = Language::Scala.initialization_options().unwrap();
         assert_eq!(opts["isHttpEnabled"], false);
         assert_eq!(opts["statusBarProvider"], "on");
+        assert!(Language::Elm.initialization_options().is_none());
     }
 }

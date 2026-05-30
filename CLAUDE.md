@@ -98,9 +98,10 @@ the "symmetric clients" invariant from `DESIGN.md`.
 - `language.rs` — `Language` enum + per-language descriptors (binary name,
   install hint, workspace markers, capability flags). The single source of
   truth threaded through `syntax.rs`, `lsp.rs`, and `protocol.rs`. Adding a
-  third language is two steps: extend the enum, fill out the descriptor
-  methods. Currently covers `Rust` (`rust-analyzer`) and `Scala` (`metals`,
-  including `.sc` and `.sbt`).
+  new language is two steps: extend the enum, fill out the descriptor
+  methods. Currently covers `Rust` (`rust-analyzer`), `Scala` (`metals`,
+  including `.sc` and `.sbt`), and `Elm` (`elm-language-server`, `.elm`
+  files, rooted at `elm.json`).
 - `lsp.rs` — generic LSP client driven by `Language`. Spawned lazily on first
   open of a recognized extension via `LspClient::spawn(language, …)`; shared
   across buffers in the same workspace. Reader thread updates the diagnostics

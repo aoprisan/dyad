@@ -930,4 +930,23 @@ mod tests {
 
         std::fs::remove_dir_all(&base).ok();
     }
+
+    #[test]
+    fn workspace_root_walks_up_to_elm_json() {
+        let base = std::env::temp_dir().join(format!("dyad-ws-elm-{}", std::process::id()));
+        let elm_root = base.join("elm");
+        let src_dir = elm_root.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(elm_root.join("elm.json"), "").unwrap();
+        let nested = src_dir.join("Main.elm");
+        std::fs::write(&nested, "").unwrap();
+
+        let root = workspace_root_for(&nested, Language::Elm);
+        assert_eq!(
+            root.canonicalize().unwrap(),
+            elm_root.canonicalize().unwrap()
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
 }
