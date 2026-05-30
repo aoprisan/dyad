@@ -133,8 +133,15 @@ They stay dark otherwise — the editor falls back to plain text editing.
 | Key             | Action                                   |
 | --------------- | ---------------------------------------- |
 | Up / Down       | Move between files (refreshes the diff)  |
+| Enter           | Edit the file under the cursor in place; Esc returns to the list |
 | s / u / c       | Stage / unstage / commit                 |
 | Ctrl-U / Ctrl-D | Page the diff                            |
+
+The session opens on this view by default (tree hidden), so you land on
+the change list. `Enter` swaps the diff pane for the live, editable buffer
+of the selected file — edits go through the normal transaction machinery,
+and the diff refreshes when you save (`Ctrl-S`). `Esc` returns to the
+change list; `Ctrl-R` closes the overlay.
 
 ### History view (Ctrl-L)
 

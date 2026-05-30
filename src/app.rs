@@ -240,6 +240,20 @@ pub struct GitView {
     pub diff_lines: Vec<String>,
     pub diff_scroll: usize,
     pub repo_root: PathBuf,
+    /// Which pane owns the keyboard. `List` is the default review
+    /// state (navigate files, stage / unstage / commit, read the
+    /// diff). `Editor` opens the file under the cursor into the buffer
+    /// and routes keystrokes there so the user can edit without
+    /// leaving the overlay; the diff refreshes on save. Enter enters
+    /// `Editor`; Esc returns to `List`.
+    pub focus: GitFocus,
+}
+
+/// Keyboard focus for the git overlay. See `GitView::focus`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GitFocus {
+    List,
+    Editor,
 }
 
 pub struct GitFile {
@@ -364,6 +378,14 @@ impl App {
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        // Startup view: hide the tree and open the git overlay so the
+        // session lands on the change-list. Both fall back gracefully —
+        // `toggle_git_diff` just sets a status hint (and leaves the
+        // normal editor showing) when there's no repo or a clean tree.
+        self.tree.focused = false;
+        if self.diff.is_none() {
+            self.toggle_git_diff();
+        }
         while self.running {
             terminal.draw(|frame| ui::render(frame, self))?;
             self.handle_events()?;
@@ -522,6 +544,14 @@ impl App {
                     self.text_search = None;
                 } else if self.history.is_some() {
                     self.history = None;
+                } else if self.diff_editor_focus() {
+                    // Leave the editor pane back to the change-list and
+                    // refresh the diff so any just-saved edits show up.
+                    if let Some(v) = self.diff.as_mut() {
+                        v.focus = GitFocus::List;
+                    }
+                    self.refresh_git_view();
+                    self.status.clear();
                 } else if self.diff.is_some() {
                     self.diff = None;
                 } else if self.tree.focused {
@@ -556,7 +586,10 @@ impl App {
                 self.drive_history(action);
                 return Ok(());
             }
-            _ if self.diff.is_some() => {
+            // List focus drives the change-list. Editor focus falls
+            // through to the normal edit path below so keystrokes mutate
+            // the buffer for the file under the cursor.
+            _ if self.diff.is_some() && !self.diff_editor_focus() => {
                 self.drive_diff(action)?;
                 return Ok(());
             }
@@ -654,6 +687,13 @@ impl App {
                 Ok(bytes) => {
                     self.status = format!("Saved {} bytes", bytes);
                     self.git_status = compute_git_status(self.buffer.path());
+                    // While editing in the git overlay the diff sits next
+                    // to the buffer — refresh it so the saved change is
+                    // reflected immediately. (`git.diff` reads disk, so
+                    // this only updates after a save, not per keystroke.)
+                    if self.diff.is_some() {
+                        self.refresh_git_view();
+                    }
                 }
                 Err(e) => self.status = format!("Save failed: {}", e),
             },
@@ -1634,6 +1674,7 @@ impl App {
             diff_lines: Vec::new(),
             diff_scroll: 0,
             repo_root,
+            focus: GitFocus::List,
         };
         load_diff_for_cursor(&mut view);
         self.diff = Some(view);
@@ -1643,7 +1684,54 @@ impl App {
     /// refreshes the diff pane); Ctrl-U/D (PageUp/PageDown) scrolls
     /// the diff; Home/End jump within the file list. Letter keys
     /// 's' / 'u' / 'c' run git commands.
+    /// True when the git overlay is open and the editor pane (not the
+    /// change-list) owns the keyboard.
+    fn diff_editor_focus(&self) -> bool {
+        self.diff
+            .as_ref()
+            .is_some_and(|v| v.focus == GitFocus::Editor)
+    }
+
+    /// Open the file under the git cursor into the buffer and hand the
+    /// keyboard to the editor pane. The diff stays visible to its left.
+    /// Refuses if the current buffer has unsaved changes (you'd lose
+    /// them on the swap); no-op when the cursor file is already open.
+    fn enter_diff_editor(&mut self) -> Result<()> {
+        let Some(view) = self.diff.as_ref() else {
+            return Ok(());
+        };
+        let Some(file) = view.files.get(view.cursor) else {
+            return Ok(());
+        };
+        let abs = view.repo_root.join(&file.path);
+        let already_open = self.buffer.path() == Some(abs.as_path());
+        if !already_open {
+            if self.buffer.is_dirty() {
+                self.status = "Save first — current buffer has unsaved changes".into();
+                return Ok(());
+            }
+            if let Err(e) = self.open_file(&abs) {
+                self.status = format!("Could not open {}: {e}", abs.display());
+                return Ok(());
+            }
+        }
+        if let Some(view) = self.diff.as_mut() {
+            view.focus = GitFocus::Editor;
+        }
+        // `open_file` lands in View mode; the user pressed Enter to edit,
+        // so drop the read-only gate. They can still Ctrl-V back to View.
+        self.mode = Mode::Edit;
+        self.status = "Edit — Esc back to git list".into();
+        Ok(())
+    }
+
     fn drive_diff(&mut self, action: Action) -> Result<()> {
+        // Enter opens the file under the cursor for editing in the right
+        // pane. Handled before the mutable borrow below so it can swap
+        // the buffer.
+        if matches!(action, Action::Insert('\n')) {
+            return self.enter_diff_editor();
+        }
         let Some(view) = self.diff.as_mut() else {
             return Ok(());
         };
@@ -2703,6 +2791,53 @@ fn foo(
         // Save passes through — the buffer wasn't dirty, but the action
         // shouldn't be blocked.
         app.apply(Action::Save).unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Build a git overlay over the open buffer with the given focus,
+    /// without shelling out to git (the temp file isn't in a repo).
+    fn attach_git_overlay(app: &mut App, path: &Path, focus: GitFocus) {
+        app.diff = Some(GitView {
+            files: vec![GitFile {
+                path: PathBuf::from(path.file_name().unwrap()),
+                staged: ' ',
+                unstaged: 'M',
+                group: GitGroup::Modified,
+            }],
+            cursor: 0,
+            diff_lines: Vec::new(),
+            diff_scroll: 0,
+            repo_root: path.parent().unwrap().to_path_buf(),
+            focus,
+        });
+    }
+
+    #[test]
+    fn editing_flows_through_in_git_editor_focus() {
+        let (mut app, path) = app_on_temp_txt("git-edit", "hello\n");
+        attach_git_overlay(&mut app, &path, GitFocus::Editor);
+        // Enter dropped us into Edit mode; the keystroke should reach the
+        // buffer even though the git overlay is open.
+        app.mode = Mode::Edit;
+        app.apply(Action::Insert('X')).unwrap();
+        assert!(app.buffer.rope().to_string().starts_with('X'));
+        assert!(app.buffer.is_dirty());
+        // Overlay stays open alongside the edit.
+        assert!(app.diff.is_some());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn git_list_focus_swallows_buffer_keys() {
+        let (mut app, path) = app_on_temp_txt("git-list", "hello\n");
+        attach_git_overlay(&mut app, &path, GitFocus::List);
+        app.mode = Mode::Edit;
+        let before = app.buffer.rope().to_string();
+        // In list focus the key routes to the change-list driver, not the
+        // buffer — 'X' isn't a git command, so nothing changes.
+        app.apply(Action::Insert('X')).unwrap();
+        assert_eq!(app.buffer.rope().to_string(), before);
+        assert!(!app.buffer.is_dirty());
         std::fs::remove_file(&path).ok();
     }
 

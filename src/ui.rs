@@ -4,7 +4,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{
-    App, GitFile, GitGroup, GitView, HistoryView, OpenFileView, TextSearchView, TypeSearchView,
+    App, GitFile, GitFocus, GitGroup, GitView, HistoryView, OpenFileView, TextSearchView,
+    TypeSearchView,
 };
 use crate::git::LineStatus;
 use crate::syntax::{self, HighlightSpan};
@@ -67,7 +68,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_text(frame, text_rect, app);
     }
     render_status(frame, status_area, app);
-    if !app.keys_help
+    if app.diff.as_ref().is_some_and(|v| v.focus == GitFocus::Editor) {
+        // The editable buffer lives in the right pane of the git split,
+        // not the normal text_rect — place the cursor there.
+        let (_list, _gutter, text) = git_editor_split(editor_area, app);
+        place_cursor(frame, text, app);
+    } else if !app.keys_help
         && app.open_file.is_none()
         && app.type_search.is_none()
         && app.text_search.is_none()
@@ -127,16 +133,48 @@ fn render_tree(frame: &mut Frame, rect: Rect, tree: &mut FileTree) {
 
 fn render_diff(frame: &mut Frame, rect: Rect, app: &App) {
     let Some(view) = app.diff.as_ref() else { return };
-    // Two-pane horizontal layout: change-list on the left, diff on
-    // the right. The change-list is sized to the longest entry's
-    // rough width, clamped to keep the diff readable.
-    let list_width = 36u16.min(rect.width.saturating_sub(20));
+    // Editor focus: change-list on the left, the live editable buffer
+    // (gutter + text, with git markers in the gutter) on the right.
+    if view.focus == GitFocus::Editor {
+        let (list_rect, gutter_rect, text_rect) = git_editor_split(rect, app);
+        render_git_files(frame, list_rect, view);
+        render_gutter(frame, gutter_rect, app, gutter_rect.width);
+        render_text(frame, text_rect, app);
+        return;
+    }
+    // List focus: change-list on the left, read-only diff on the right.
+    // The change-list is sized to the longest entry's rough width,
+    // clamped to keep the diff readable.
+    let list_width = git_list_width(rect);
     let split = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(list_width), Constraint::Min(1)])
         .split(rect);
     render_git_files(frame, split[0], view);
     render_git_diff(frame, split[1], view);
+}
+
+/// Width of the change-list pane in the git overlay. Shared by the
+/// diff and editor layouts so the list lines up in both.
+fn git_list_width(rect: Rect) -> u16 {
+    36u16.min(rect.width.saturating_sub(20))
+}
+
+/// Layout for the git overlay's editor focus: returns the change-list
+/// rect, plus the gutter and text rects of the buffer pane. Kept in one
+/// place so `render_diff` and cursor placement agree on the text rect.
+fn git_editor_split(rect: Rect, app: &App) -> (Rect, Rect, Rect) {
+    let list_width = git_list_width(rect);
+    let outer = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(list_width), Constraint::Min(1)])
+        .split(rect);
+    let gw = gutter_width(app.buffer.line_count());
+    let inner = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(gw), Constraint::Min(1)])
+        .split(outer[1]);
+    (outer[0], inner[0], inner[1])
 }
 
 fn render_git_files(frame: &mut Frame, rect: Rect, view: &GitView) {
@@ -387,6 +425,7 @@ const KEYS_HELP: &[KeyRow] = &[
     KeyRow::Binding("Enter", "open file / expand dir / ascend ↰ .."),
     KeyRow::Section("Git view"),
     KeyRow::Binding("Up / Down", "move between files (refreshes diff)"),
+    KeyRow::Binding("Enter", "edit file under cursor (Esc to return)"),
     KeyRow::Binding("s / u / c", "stage / unstage / commit"),
     KeyRow::Binding("Ctrl-U / Ctrl-D", "page the diff"),
     KeyRow::Section("History view"),
@@ -704,12 +743,30 @@ fn render_status(frame: &mut Frame, rect: Rect, app: &App) {
     if app.diff.is_some() {
         let bar = theme::status_bar();
         let hint_style = theme::status_hint();
+        let editor_focus = app.diff.as_ref().is_some_and(|v| v.focus == GitFocus::Editor);
         let left = if !app.status.is_empty() {
             format!(" {} ", app.status)
+        } else if editor_focus {
+            // Editing the buffer in the right pane — show its path and
+            // cursor position like the normal editor status bar.
+            let path = match app.buffer.path() {
+                Some(p) => p.display().to_string(),
+                None => "[scratch]".into(),
+            };
+            let dirty = if app.buffer.is_dirty() { "+" } else { "·" };
+            format!(
+                " {path}  L{line}:C{col}  {dirty} ",
+                line = app.view.cursor_line() + 1,
+                col = app.view.cursor_col() + 1,
+            )
         } else {
             " Git status ".to_string()
         };
-        let right = DIFF_HINT_TEXT.to_string();
+        let right = if editor_focus {
+            GIT_EDIT_HINT_TEXT.to_string()
+        } else {
+            DIFF_HINT_TEXT.to_string()
+        };
         let total_width = rect.width as usize;
         let pad = total_width
             .saturating_sub(left.chars().count() + right.chars().count());
@@ -828,7 +885,10 @@ const TREE_HINT_TEXT: &str =
     " ↑/↓ move · Enter open · Esc close · Ctrl-T toggle ";
 
 const DIFF_HINT_TEXT: &str =
-    " ↑/↓ file · s stage · u unstage · c commit · Ctrl-U/D page · Esc close ";
+    " ↑/↓ file · Enter edit · s stage · u unstage · c commit · Ctrl-U/D page · Esc close ";
+
+const GIT_EDIT_HINT_TEXT: &str =
+    " editing · Esc back to git · Ctrl-V view · Ctrl-S save ";
 
 const HISTORY_HINT_TEXT: &str =
     " ↑/↓ commit · Ctrl-U/D page · Esc close · Ctrl-L toggle ";
