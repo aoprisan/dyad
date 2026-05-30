@@ -243,6 +243,23 @@ Known scope limits in this iteration:
   `scope.imports` does not. `locals` (params / `let` bindings via a
   Tree-sitter scope walk) is the deferred piece — imports + enclosing +
   siblings ship first (see `PLAN.md` Phase 2).
+- `context.pack(buffer, position, token_budget)` bundles source context
+  around a point under a token budget. v0 is a deterministic,
+  priority-ordered greedy packer — **no scoring model** — and is
+  LSP-free: (1) the anchor is the innermost enclosing function
+  (Tree-sitter, always kept even if it alone busts the budget); (2) the
+  file's imports; (3) one-line signatures of the other top-level items.
+  Candidates are added in that order until one would exceed the budget,
+  and `truncated` is *always* reported so a partial pack is never
+  mistaken for a complete one (the `tasks.list` honesty rule). Token
+  cost is the cheap `chars / 4` estimate, surfaced per slice and in
+  total so the agent recalibrates against its own tokenizer. Ranges are
+  buffer-native (line + char offset, not UTF-16). The richer rungs the
+  feature ultimately wants — referenced type definitions
+  (`symbol.definition`), callee signatures (`symbol.hover`), and the
+  enclosing item's docstring, all LSP-backed — are deferred to v1 (see
+  `PLAN.md` Phase 3); the greedy packer is the stable core they'll slot
+  into as additional priority tiers.
 - Phase 10 ships the protocol surface for proposals
   (`edit.propose_range`, `proposals.list`, `proposals.accept`,
   `proposals.reject`). Accept runs the deferred edit through the same

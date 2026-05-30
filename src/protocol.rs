@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use ropey::Rope;
 use serde::{Deserialize, Serialize};
 
 use crate::buffer::Buffer;
@@ -183,6 +184,36 @@ pub struct ScopeReport {
     pub enclosing: Vec<SymbolRef>,
     pub imports: Vec<ImportEntry>,
     pub siblings: Vec<SymbolRef>,
+}
+
+/// One slice of packed context. `range` is in the buffer's native
+/// coordinates (line + char offset within the line, *not* UTF-16 — that
+/// convention is confined to the LSP layer). `reason` says why it was
+/// included (`"anchor: enclosing function"`, `"import"`,
+/// `"sibling signature"`); `estimated_tokens` is the cheap `chars / 4`
+/// heuristic the packer budgeted against.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ContextSlice {
+    pub path: Option<String>,
+    pub range: lsp::Range,
+    pub reason: String,
+    pub text: String,
+    pub estimated_tokens: usize,
+}
+
+/// Result of `context.pack`: a budget-bounded bundle of source slices
+/// assembled around a point, anchored on the enclosing function.
+/// `anchor` is that function's range (or `None` if the point isn't
+/// inside one). `truncated` is **always** reported — `true` means the
+/// budget stopped us before every candidate slice was included, so the
+/// agent knows the pack is partial (never a silent drop). `estimated_
+/// tokens` is the summed `chars / 4` estimate of the included slices.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct PackedContext {
+    pub anchor: Option<lsp::Range>,
+    pub slices: Vec<ContextSlice>,
+    pub estimated_tokens: usize,
+    pub truncated: bool,
 }
 
 impl SymbolRef {
@@ -974,6 +1005,148 @@ impl ProtocolState {
         })
     }
 
+    // ---------- Context ----------
+
+    /// Pack source context around `(line, character)` into at most
+    /// `token_budget` estimated tokens. v0 is a deterministic,
+    /// LSP-free, priority-ordered greedy packer (DESIGN.md §Dogfooding):
+    ///
+    /// 1. **anchor** — the innermost enclosing function (Tree-sitter),
+    ///    always kept even if it alone exceeds the budget (it's the
+    ///    point of the pack);
+    /// 2. **imports** — the file's import declarations;
+    /// 3. **sibling signatures** — the first line of each other
+    ///    top-level item.
+    ///
+    /// Candidates are added in that order until one would exceed the
+    /// budget, at which point packing stops and `truncated` is set.
+    /// Token cost is the cheap `chars / 4` heuristic, surfaced per slice
+    /// and in total so the agent can recalibrate. The richer rungs from
+    /// the design (referenced type defs, callee signatures, docstrings —
+    /// all LSP-backed) are deferred to v1; see `PLAN.md` Phase 3.
+    pub fn context_pack(
+        &self,
+        buffer_id: u64,
+        line: u32,
+        character: u32,
+        token_budget: usize,
+    ) -> Result<PackedContext> {
+        let entry = self.buffer_entry(buffer_id)?;
+        let language = entry
+            .language
+            .context("buffer has no recognized language; cannot pack context")?;
+        let syn = entry
+            .syntax
+            .as_ref()
+            .context("buffer has no syntax (unsupported language)")?;
+        let rope = entry.buffer.rope();
+        let path = entry.buffer.path().map(|p| p.display().to_string());
+
+        let point_char = lsp_pos_to_char(&entry.buffer, line, character)?;
+        let point_byte = rope.char_to_byte(point_char);
+
+        let mut candidates: Vec<ContextSlice> = Vec::new();
+        // Spans already represented, so a top-level item that is also an
+        // import (or the anchor itself) isn't packed twice.
+        let mut covered: Vec<(usize, usize)> = Vec::new();
+        let mut anchor_range = None;
+        let mut anchor_span: Option<(usize, usize)> = None;
+
+        // 1. Anchor: innermost enclosing function.
+        if let Some(fq) = language.function_query() {
+            let fns = syn.ast_query(rope, fq)?;
+            if let Some(m) = fns
+                .iter()
+                .filter(|m| {
+                    m.capture == "fn" && m.byte_start <= point_byte && point_byte < m.byte_end
+                })
+                .min_by_key(|m| m.byte_end - m.byte_start)
+            {
+                anchor_span = Some((m.byte_start, m.byte_end));
+                anchor_range = Some(byte_span_to_range(rope, m.byte_start, m.byte_end));
+                covered.push((m.byte_start, m.byte_end));
+                candidates.push(make_context_slice(
+                    rope,
+                    path.clone(),
+                    m.byte_start,
+                    m.byte_end,
+                    "anchor: enclosing function",
+                ));
+            }
+        }
+
+        // 2. Imports (LSP-free).
+        if let Some(iq) = language.import_query() {
+            for m in syn.ast_query(rope, iq)? {
+                if m.capture != "import" {
+                    continue;
+                }
+                covered.push((m.byte_start, m.byte_end));
+                candidates.push(make_context_slice(
+                    rope,
+                    path.clone(),
+                    m.byte_start,
+                    m.byte_end,
+                    "import",
+                ));
+            }
+        }
+
+        // 3. Sibling signatures: first line of each other top-level item.
+        if let Some(mq) = language.module_items_query() {
+            let mut count = 0;
+            for m in syn.ast_query(rope, mq)? {
+                if m.capture != "item" || m.kind.contains("comment") {
+                    continue;
+                }
+                let span = (m.byte_start, m.byte_end);
+                if covered.contains(&span) {
+                    continue;
+                }
+                // Skip items nested inside the anchor — already in its body.
+                if anchor_span.is_some_and(|(bs, be)| m.byte_start >= bs && m.byte_end <= be) {
+                    continue;
+                }
+                let sig_end = first_line_end_byte(rope, m.byte_start, m.byte_end);
+                candidates.push(make_context_slice(
+                    rope,
+                    path.clone(),
+                    m.byte_start,
+                    sig_end,
+                    "sibling signature",
+                ));
+                count += 1;
+                if count >= CONTEXT_MAX_SIBLINGS {
+                    break;
+                }
+            }
+        }
+
+        // Greedy pack in priority order. Index 0 (the anchor, or the
+        // first import if there's no enclosing function) is always kept;
+        // the first later candidate that would overflow the budget stops
+        // the pack and flips `truncated` — never a silent drop.
+        let mut slices = Vec::new();
+        let mut total = 0usize;
+        let mut truncated = false;
+        for (i, cand) in candidates.into_iter().enumerate() {
+            if i == 0 || total + cand.estimated_tokens <= token_budget {
+                total += cand.estimated_tokens;
+                slices.push(cand);
+            } else {
+                truncated = true;
+                break;
+            }
+        }
+
+        Ok(PackedContext {
+            anchor: anchor_range,
+            slices,
+            estimated_tokens: total,
+            truncated,
+        })
+    }
+
     // ---------- Inline agent tasks ----------
 
     /// Walk the workspace beneath `buffer_id` for inline agent task
@@ -1290,6 +1463,71 @@ pub(crate) fn scan_inline_tasks(root: &Path) -> Vec<InlineTask> {
     }
     hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
     hits
+}
+
+/// Cap on sibling-signature candidates `context.pack` assembles, so a
+/// large file can't balloon candidate construction. The token budget
+/// bounds what's *included*; this bounds what's *considered*.
+const CONTEXT_MAX_SIBLINGS: usize = 50;
+
+/// Cheap token estimate — roughly 4 chars per token. A real tokenizer
+/// is out of scope for v0; `context.pack` returns this estimate so the
+/// agent can recalibrate against its own model.
+fn estimate_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(4)
+}
+
+/// Convert a byte offset to a buffer-native [`lsp::Position`] (line +
+/// char offset within the line — not UTF-16). Clamps past-EOF offsets.
+fn byte_to_position(rope: &Rope, byte: usize) -> lsp::Position {
+    let byte = byte.min(rope.len_bytes());
+    let line = rope.byte_to_line(byte);
+    let line_start = rope.byte_to_char(rope.line_to_byte(line));
+    let character = rope.byte_to_char(byte) - line_start;
+    lsp::Position {
+        line: line as u32,
+        character: character as u32,
+    }
+}
+
+fn byte_span_to_range(rope: &Rope, start: usize, end: usize) -> lsp::Range {
+    lsp::Range {
+        start: byte_to_position(rope, start),
+        end: byte_to_position(rope, end),
+    }
+}
+
+/// Byte offset of the first newline in `[start, end)`, or `end` if the
+/// span is single-line. Used to trim a top-level item down to its
+/// signature line.
+fn first_line_end_byte(rope: &Rope, start: usize, end: usize) -> usize {
+    let text = rope
+        .slice(rope.byte_to_char(start)..rope.byte_to_char(end))
+        .to_string();
+    match text.find('\n') {
+        Some(idx) => start + idx,
+        None => end,
+    }
+}
+
+/// Build a [`ContextSlice`] for the byte span `[start, end)`.
+fn make_context_slice(
+    rope: &Rope,
+    path: Option<String>,
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> ContextSlice {
+    let text = rope
+        .slice(rope.byte_to_char(start)..rope.byte_to_char(end))
+        .to_string();
+    ContextSlice {
+        path,
+        range: byte_span_to_range(rope, start, end),
+        reason: reason.to_string(),
+        estimated_tokens: estimate_tokens(&text),
+        text,
+    }
 }
 
 /// Does `range` cover the zero-based `(line, character)` point? Used by
@@ -1754,6 +1992,93 @@ mod tests {
             !report.siblings.is_empty() || !report.enclosing.is_empty(),
             "expected some document symbols from main.rs",
         );
+    }
+
+    /// Build a fresh single-buffer state whose sole buffer holds `src`,
+    /// with syntax refreshed. LSP-free — fine for the tree-sitter paths.
+    fn rust_state_with(name: &str, src: &str) -> ProtocolState {
+        let mut state = scratch_state(name);
+        let v = state.buffer_version(SOLE_BUFFER_ID).unwrap();
+        let len = text_of(&state, SOLE_BUFFER_ID).chars().count();
+        state
+            .edit_replace_range(SOLE_BUFFER_ID, v, CharRange { start: 0, end: len }, src)
+            .unwrap();
+        state
+    }
+
+    const PACK_FIXTURE: &str = "\
+use std::fmt;
+use std::io::Read;
+
+struct Helper;
+
+fn target() {
+    let x = 1;
+    let y = 2;
+}
+
+fn neighbor() {}
+";
+
+    #[test]
+    fn context_pack_anchors_on_enclosing_function_first() {
+        let state = rust_state_with("pack_anchor", PACK_FIXTURE);
+        // Point inside `target` (line 6 is `let x = 1;`).
+        let packed = state.context_pack(SOLE_BUFFER_ID, 6, 8, 1000).unwrap();
+        assert!(!packed.truncated, "1000 tokens easily fits this fixture");
+        // Anchor is `target`'s range and is the first slice.
+        assert!(packed.anchor.is_some());
+        assert_eq!(packed.slices[0].reason, "anchor: enclosing function");
+        assert!(packed.slices[0].text.contains("fn target()"));
+        assert!(packed.slices[0].text.contains("let y = 2;"));
+
+        // The two imports and the sibling signatures (struct Helper, fn
+        // neighbor) come after the anchor, never duplicated.
+        let reasons: Vec<&str> = packed.slices.iter().map(|s| s.reason.as_str()).collect();
+        assert_eq!(reasons.iter().filter(|r| **r == "import").count(), 2);
+        let sib_text: Vec<&str> = packed
+            .slices
+            .iter()
+            .filter(|s| s.reason == "sibling signature")
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(sib_text.iter().any(|t| t.contains("struct Helper")));
+        assert!(sib_text.iter().any(|t| t.contains("fn neighbor()")));
+        // Sibling signatures are single-line (no body).
+        assert!(sib_text.iter().all(|t| !t.contains('\n')));
+        // estimated_tokens is the sum of included slices.
+        let summed: usize = packed.slices.iter().map(|s| s.estimated_tokens).sum();
+        assert_eq!(packed.estimated_tokens, summed);
+    }
+
+    #[test]
+    fn context_pack_flags_truncation_on_a_tiny_budget() {
+        let state = rust_state_with("pack_trunc", PACK_FIXTURE);
+        // A budget of 1 token can't fit anything beyond the always-kept
+        // anchor, so packing stops after it and flags truncation.
+        let packed = state.context_pack(SOLE_BUFFER_ID, 6, 8, 1).unwrap();
+        assert!(packed.truncated);
+        assert_eq!(packed.slices.len(), 1);
+        assert_eq!(packed.slices[0].reason, "anchor: enclosing function");
+    }
+
+    #[test]
+    fn context_pack_without_enclosing_function_packs_imports() {
+        let state = rust_state_with("pack_toplevel", PACK_FIXTURE);
+        // Line 0 is `use std::fmt;` — not inside any function.
+        let packed = state.context_pack(SOLE_BUFFER_ID, 0, 0, 1000).unwrap();
+        assert!(packed.anchor.is_none());
+        assert!(!packed.slices.is_empty());
+        // First slice is an import (no anchor to lead with).
+        assert_eq!(packed.slices[0].reason, "import");
+    }
+
+    #[test]
+    fn estimate_tokens_is_chars_over_four_rounded_up() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abc"), 1);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcde"), 2);
     }
 
     #[test]

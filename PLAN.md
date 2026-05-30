@@ -140,6 +140,14 @@ nothing else does well. Higher design risk, so it follows the two contained wins
 priority-ordered greedy packer (no scoring model), document it as v0 in
 `DESIGN.md`, iterate later. **Effort: ~2 sessions.**
 
+**Shipped (v0):** anchor (enclosing fn) → imports → sibling signatures, all
+Tree-sitter / LSP-free, greedily packed to a `chars/4` budget with an
+always-reported `truncated` flag. Deviation from the sketch: the anchor is
+resolved with Tree-sitter rather than `scope_in_scope`, so `context.pack`
+needs no language server. The LSP-backed rungs (referenced type defs, callee
+signatures via `symbol.hover`, enclosing-item docstring) are the deferred v1 —
+they slot in as lower-priority candidate tiers behind the existing greedy pack.
+
 ---
 
 ## Phase 4 — Live TUI+MCP coexistence (the north star) — *larger track*

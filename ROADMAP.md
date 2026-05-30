@@ -30,6 +30,11 @@ spec'd" means it would help agents but isn't in the design doc yet.
   capture per `Language::import_query`); `scope.in_scope` layers LSP
   `documentSymbol` for `enclosing` (outer→inner) + `siblings` on top.
   `locals` (Tree-sitter scope walk) deferred — see `PLAN.md`.
+- `context.pack(buffer, position, token_budget)` — v0 deterministic
+  greedy packer (LSP-free): anchor (enclosing fn) → imports → sibling
+  signatures, packed to a `chars/4` token budget with an always-honest
+  `truncated` flag. Richer rungs (referenced type defs, callee
+  signatures, docstrings — LSP-backed) deferred to v1; see `PLAN.md`.
 
 ## High leverage, medium effort
 

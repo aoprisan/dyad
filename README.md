@@ -178,6 +178,7 @@ The current surface (`tools/list` over `--mcp`):
 | `tasks.list`                  | Scan the workspace for inline `// CLAUDE: …` / `// TODO(claude): …` markers.           |
 | `test.run` / `.last_results`  | Run the buffer language's tests (Rust → `cargo test`, optional `target` filter); returns `{passed, failed, ignored, failures, exit_ok, raw_tail}` and caches the last run. |
 | `scope.imports` / `.in_scope` | What's visible at a point: imports (LSP-free tree-sitter), plus enclosing (outer→inner) and sibling symbols from LSP `documentSymbol`. |
+| `context.pack`                | Budget-bounded context bundle around a point: enclosing fn + imports + sibling signatures, greedily packed to a token budget with a `truncated` flag. |
 | `git.diff` / `.status` / `.log` / `.show` / `.stage` / `.unstage` / `.commit` | Git plumbing scoped to the buffer's repo. |
 | `clients.list`                | Active clients (currently the MCP session — TUI presence is a follow-up).              |
 

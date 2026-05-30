@@ -152,6 +152,29 @@ impl Language {
         }
     }
 
+    /// Tree-sitter query whose `@fn` capture selects function-like
+    /// definitions, used by `context.pack` to find the enclosing
+    /// function (the pack anchor). Rust-only in this iteration; other
+    /// languages return `None` and `context.pack` falls back to an
+    /// import-only pack. Node kinds are grammar-specific.
+    pub fn function_query(self) -> Option<&'static str> {
+        match self {
+            Self::Rust => Some("(function_item) @fn"),
+            Self::Scala | Self::Elm => None,
+        }
+    }
+
+    /// Tree-sitter query whose `@item` capture selects the file's
+    /// top-level items, used by `context.pack` to gather sibling
+    /// signatures. Rust-only for now (the `source_file` root node is
+    /// grammar-specific); other languages return `None`.
+    pub fn module_items_query(self) -> Option<&'static str> {
+        match self {
+            Self::Rust => Some("(source_file (_) @item)"),
+            Self::Scala | Self::Elm => None,
+        }
+    }
+
     /// Which output parser `test_runner` should apply to this language's
     /// `test_command` output. `None` exactly when `test_command` is
     /// `None`.

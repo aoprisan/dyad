@@ -60,6 +60,10 @@ RESPONSES="$(
     # scope.imports against the .rs buffer (LSP-free tree-sitter query).
     # src/main.rs opens with `use std::path::PathBuf;`.
     echo '{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"scope.imports","arguments":{"buffer_id":3}}}'
+    # context.pack at the top of main.rs (LSP-free): no enclosing fn, so
+    # the pack leads with imports and reports truncated=false at a big
+    # budget.
+    echo '{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"context.pack","arguments":{"buffer_id":3,"line":0,"character":0,"token_budget":2000}}}'
   } | "$BIN" --mcp "$FIXTURE"
 )"
 
@@ -116,6 +120,7 @@ assert_contains 2 '"name":"test.run"'
 assert_contains 2 '"name":"test.last_results"'
 assert_contains 2 '"name":"scope.imports"'
 assert_contains 2 '"name":"scope.in_scope"'
+assert_contains 2 '"name":"context.pack"'
 assert_contains 3 'fn hello() {}'
 # id=4's payload is a JSON-stringified array inside an MCP text content
 # item, so quotes are backslash-escaped on the wire — match that form.
@@ -143,5 +148,9 @@ assert_contains 16 '\"exit_ok\":'
 # scope.imports finds the leading `use std::path::PathBuf;` in main.rs.
 assert_contains 17 '"isError":false'
 assert_contains 17 'use std::path::PathBuf;'
+# context.pack returns a bundle with the truncated flag and an import slice.
+assert_contains 18 '"isError":false'
+assert_contains 18 '\"truncated\":false'
+assert_contains 18 '\"reason\":\"import\"'
 
 echo "PASS: mcp-smoke"

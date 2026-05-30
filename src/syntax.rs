@@ -599,4 +599,36 @@ mod tests {
             );
         }
     }
+
+    /// The Rust `function_query` / `module_items_query` (from the
+    /// `Language` registry, used by `context.pack`) must compile and
+    /// capture what they claim: an enclosing function and the file's
+    /// top-level items.
+    #[test]
+    fn context_queries_match_rust_structure() {
+        use crate::language::Language;
+        let mut buf = scratch_buffer("ctx_queries");
+        buf.insert_str(0, "use std::fmt;\nstruct S;\nfn a() {}\nfn b() {}\n");
+        let mut syn = Syntax::rust().unwrap();
+        syn.refresh(&mut buf);
+
+        let fns: Vec<String> = syn
+            .ast_query(buf.rope(), Language::Rust.function_query().unwrap())
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.capture == "fn")
+            .map(|m| slice(buf.rope(), m.byte_start, m.byte_end))
+            .collect();
+        assert_eq!(fns.len(), 2, "two functions expected, got {fns:?}");
+
+        let items: Vec<String> = syn
+            .ast_query(buf.rope(), Language::Rust.module_items_query().unwrap())
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.capture == "item")
+            .map(|m| slice(buf.rope(), m.byte_start, m.byte_end))
+            .collect();
+        // use, struct, fn a, fn b — four top-level items.
+        assert_eq!(items.len(), 4, "four top-level items expected, got {items:?}");
+    }
 }

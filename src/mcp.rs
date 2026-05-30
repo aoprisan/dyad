@@ -200,6 +200,16 @@ fn tools_list_result() -> Value {
                     "character": {"type": "integer", "minimum": 0},
                 },
             })),
+            tool_def("context.pack", "Pack source context around a zero-based (line, character) into at most `token_budget` estimated tokens (~4 chars/token). Deterministic priority-greedy v0: anchor (innermost enclosing function, always kept) -> imports -> sibling signatures. Returns {anchor, slices: [{path, range, reason, text, estimated_tokens}], estimated_tokens, truncated}. `truncated` is always reported — true means the budget stopped packing before all candidates fit.", json!({
+                "type": "object",
+                "required": ["buffer_id", "line", "character", "token_budget"],
+                "properties": {
+                    "buffer_id":    {"type": "integer"},
+                    "line":         {"type": "integer", "minimum": 0},
+                    "character":    {"type": "integer", "minimum": 0},
+                    "token_budget": {"type": "integer", "minimum": 1},
+                },
+            })),
             tool_def("edit.propose_range", "Queue an `edit.replace_range` for review instead of applying it. Returns a proposal_id. The reviewer (eventually a human at the TUI) accepts or rejects via the `proposals.*` tools.", json!({
                 "type": "object",
                 "required": ["buffer_id", "version", "range", "text", "intent"],
@@ -564,6 +574,22 @@ fn dispatch_tool(
             }
             let a: Args = serde_json::from_value(args)?;
             Ok(json!(state.scope_in_scope(a.buffer_id, a.line, a.character)?))
+        }
+        "context.pack" => {
+            #[derive(Deserialize)]
+            struct Args {
+                buffer_id: u64,
+                line: u32,
+                character: u32,
+                token_budget: usize,
+            }
+            let a: Args = serde_json::from_value(args)?;
+            Ok(json!(state.context_pack(
+                a.buffer_id,
+                a.line,
+                a.character,
+                a.token_budget,
+            )?))
         }
         "edit.propose_range" => {
             #[derive(Deserialize)]
@@ -942,6 +968,7 @@ mod tests {
             "test.last_results",
             "scope.imports",
             "scope.in_scope",
+            "context.pack",
             "edit.propose_range",
             "proposals.list",
             "proposals.accept",

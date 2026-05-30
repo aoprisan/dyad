@@ -290,6 +290,36 @@ fn scope_imports_lists_use_declarations_through_jsonrpc() {
 }
 
 #[test]
+fn context_pack_anchors_on_the_enclosing_function_through_jsonrpc() {
+    let mut s = McpSession::start(
+        "use std::fmt;\n\nfn target() {\n    let x = 1;\n}\n\nfn other() {}\n",
+        "context_pack",
+    );
+    let _ = s.call(1, "initialize", json!({}));
+    // Point inside `target` (line 3 = `    let x = 1;`).
+    let resp = s.call_tool(
+        2,
+        "context.pack",
+        json!({ "buffer_id": 1, "line": 3, "character": 8, "token_budget": 1000 }),
+    );
+    assert_eq!(resp["result"]["isError"], false);
+    let packed = tool_payload(&resp);
+    assert!(packed["anchor"].is_object());
+    assert_eq!(packed["truncated"], false);
+    let slices = packed["slices"].as_array().unwrap();
+    assert_eq!(slices[0]["reason"], "anchor: enclosing function");
+    assert!(slices[0]["text"].as_str().unwrap().contains("fn target()"));
+    // Tiny budget flips truncated and keeps only the anchor.
+    let tight = tool_payload(&s.call_tool(
+        3,
+        "context.pack",
+        json!({ "buffer_id": 1, "line": 3, "character": 8, "token_budget": 1 }),
+    ));
+    assert_eq!(tight["truncated"], true);
+    assert_eq!(tight["slices"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn transaction_commit_collapses_multiple_edits_into_one_history_entry() {
     let mut s = McpSession::start("", "tx");
     let _ = s.call(1, "initialize", json!({}));
