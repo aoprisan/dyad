@@ -6,7 +6,7 @@
 //! locked core; the editor-as-runtime state (buffers, `TxManager`,
 //! `LspClient`s, the proposal queue) lives in the core so that the TUI
 //! (`App`) can become a second view over the same instance — the Phase 4
-//! daemon split (`PLAN.md`). `mcp.rs` is one transport over this surface
+//! daemon split (`ROADMAP.md`). `mcp.rs` is one transport over this surface
 //! and tests call the methods directly.
 //!
 //! Edits go through transactions. With no explicit `tx.begin` open, an
@@ -440,7 +440,7 @@ pub struct SymbolRef {
 /// outer→inner (e.g. `mod` → `impl` → `fn`); `siblings` are the other
 /// top-level symbols in the file; `imports` are the file's import
 /// declarations. `locals` (params / `let` bindings via a Tree-sitter
-/// scope walk) is deferred — see `PLAN.md` Phase 2.
+/// scope walk) is deferred — see `ROADMAP.md`.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ScopeReport {
     pub enclosing: Vec<SymbolRef>,

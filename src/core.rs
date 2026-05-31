@@ -5,7 +5,7 @@
 //! `TxManager`, the per-language `LspClient`s, the proposal queue, and
 //! the last test results. This is the single owner that both the TUI
 //! (`App`) and the agent surface (`ProtocolState`) are meant to become
-//! *views* over — the daemon split from `PLAN.md` Phase 4.
+//! *views* over — the daemon split tracked in `ROADMAP.md` (Phase 4).
 //!
 //! It's wrapped in `Arc<Mutex<…>>` by its holders. Today exactly one
 //! client drives a given core at a time (an MCP session *or* the TUI),
@@ -38,7 +38,7 @@ use crate::protocol::{
     apply_text_edits, byte_span_to_range, first_line_end_byte, lsp_pos_to_char, make_context_slice,
     range_contains, scan_inline_tasks,
 };
-use crate::syntax::{AstMatch, Syntax};
+use crate::syntax::{AstMatch, HighlightSpan, Syntax};
 use crate::test_runner::{self, TestResults};
 use crate::tx::{Change, ChangeId, TxId, TxManager};
 
@@ -84,6 +84,28 @@ struct BufferEntry {
     /// Per-buffer monotonic LSP document version (LSP needs an i32
     /// starting at 0 and incrementing on each `didChange`).
     lsp_version: i32,
+}
+
+/// One screen row's worth of rendered text for the TUI (Phase 4 step
+/// 1b scaffolding). Owned — text collected and highlight spans cloned
+/// — so the renderer can drop the core lock before walking ratatui
+/// widgets. `App` becomes the production caller when it turns into a
+/// view over the shared core; today this module's tests exercise it.
+#[allow(dead_code)] // consumed by the TUI in Phase 4 step 1b (App-on-core flip).
+#[derive(Default)]
+pub(crate) struct RenderLine {
+    pub text: String,
+    pub spans: Vec<HighlightSpan>,
+}
+
+/// Per-buffer metadata for the TUI status line and gutter geometry,
+/// snapshotted so the renderer needn't hold the lock (Phase 4 step 1b).
+#[allow(dead_code)] // consumed by the TUI in Phase 4 step 1b (App-on-core flip).
+pub(crate) struct BufferMeta {
+    pub path: Option<PathBuf>,
+    pub dirty: bool,
+    pub line_count: usize,
+    pub version: u64,
 }
 
 impl EditorCore {
@@ -791,7 +813,7 @@ impl EditorCore {
     /// symbols (`siblings`). Enclosing + siblings come from LSP
     /// `documentSymbol` (so this needs a running server); imports are
     /// the LSP-free `scope_imports`. `locals` is deferred (see
-    /// `PLAN.md`).
+    /// `ROADMAP.md`).
     pub fn scope_in_scope(
         &self,
         buffer_id: u64,
@@ -855,7 +877,7 @@ impl EditorCore {
     /// Token cost is the cheap `chars / 4` heuristic, surfaced per slice
     /// and in total so the agent can recalibrate. The richer rungs from
     /// the design (referenced type defs, callee signatures, docstrings —
-    /// all LSP-backed) are deferred to v1; see `PLAN.md` Phase 3.
+    /// all LSP-backed) are deferred to v1; see `ROADMAP.md`.
     pub fn context_pack(
         &self,
         buffer_id: u64,
@@ -1060,6 +1082,139 @@ impl EditorCore {
         self.focus
     }
 
+    // ---------- TUI lens (Phase 4 step 1b scaffolding) ----------
+    //
+    // Read/edit helpers the TUI (`App`) will call once it becomes a
+    // *view* over this shared core instead of owning its own `Buffer`
+    // + `TxManager`. They mirror the agent-facing methods above but are
+    // shaped for the per-keystroke render/edit loop: rendering pulls an
+    // owned line snapshot (lock dropped before drawing), editing runs
+    // through one auto-tx that discards a no-op so movement at a buffer
+    // boundary doesn't litter flat history. Exercised by this module's
+    // tests today; `App` is the production caller in the next step.
+    //
+    // `#[allow(dead_code)]` here is the same forward-scaffolding idiom
+    // as `focus` above — these land with the App-on-core flip.
+
+    /// Borrow a buffer for read-only View math (`char_idx`, `move_*`,
+    /// `word_at_cursor`). Read-only, so it doesn't break the "every
+    /// mutation goes through a transaction" invariant.
+    #[allow(dead_code)] // consumed by the TUI in Phase 4 step 1b (App-on-core flip).
+    pub fn buffer_ref(&self, buffer_id: u64) -> Result<&Buffer> {
+        Ok(&self.buffer_entry(buffer_id)?.buffer)
+    }
+
+    /// Snapshot lightweight per-buffer metadata for the status line and
+    /// gutter geometry without holding the lock across the render.
+    #[allow(dead_code)] // consumed by the TUI in Phase 4 step 1b (App-on-core flip).
+    pub fn buffer_meta(&self, buffer_id: u64) -> Result<BufferMeta> {
+        let entry = self.buffer_entry(buffer_id)?;
+        Ok(BufferMeta {
+            path: entry.buffer.path().map(|p| p.to_path_buf()),
+            dirty: entry.buffer.is_dirty(),
+            line_count: entry.buffer.line_count(),
+            version: entry.buffer.version(),
+        })
+    }
+
+    /// Snapshot `rows` visible lines starting at `top_line`: trailing
+    /// newline stripped, highlight spans cloned out so the caller can
+    /// drop the lock before drawing. Out-of-range rows come back empty,
+    /// matching the renderer's blank padding past end-of-buffer.
+    #[allow(dead_code)] // consumed by the TUI in Phase 4 step 1b (App-on-core flip).
+    pub fn render_lines(
+        &self,
+        buffer_id: u64,
+        top_line: usize,
+        rows: usize,
+    ) -> Result<Vec<RenderLine>> {
+        let entry = self.buffer_entry(buffer_id)?;
+        let total = entry.buffer.line_count();
+        let mut out = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let line_idx = top_line + r;
+            if line_idx >= total {
+                out.push(RenderLine::default());
+                continue;
+            }
+            let mut text: String = entry.buffer.line(line_idx).chars().collect();
+            // Strip the trailing newline so it doesn't render as a
+            // control character (mirrors the old `ui::render_text`).
+            if text.ends_with('\n') {
+                text.pop();
+                if text.ends_with('\r') {
+                    text.pop();
+                }
+            }
+            let spans = entry
+                .syntax
+                .as_ref()
+                .map(|s| s.line_spans(line_idx).to_vec())
+                .unwrap_or_default();
+            out.push(RenderLine { text, spans });
+        }
+        Ok(out)
+    }
+
+    /// Run a single TUI edit inside an auto-tx. Mirrors `App::apply`'s
+    /// old inline logic: a mutation that doesn't move the version (a
+    /// boundary no-op like `DeletePrev` at offset 0) is discarded so it
+    /// never reaches flat history; a real change commits, refreshes
+    /// syntax, and notifies the LSP. Returns whether the buffer changed.
+    #[allow(dead_code)] // consumed by the TUI in Phase 4 step 1b (App-on-core flip).
+    pub fn tui_apply_edit<F>(&mut self, buffer_id: u64, intent: String, edit: F) -> Result<bool>
+    where
+        F: FnOnce(&mut Buffer),
+    {
+        let tx_id = {
+            let entry = self
+                .buffers
+                .get(&buffer_id)
+                .ok_or_else(|| anyhow!("unknown buffer_id {}", buffer_id))?;
+            self.tx_manager.begin(intent, None, &entry.buffer)
+        };
+        let pre = self.tx_manager.pre_version(tx_id);
+        {
+            let entry = self
+                .buffers
+                .get_mut(&buffer_id)
+                .ok_or_else(|| anyhow!("unknown buffer_id {}", buffer_id))?;
+            edit(&mut entry.buffer);
+        }
+        let changed = {
+            let entry = self
+                .buffers
+                .get(&buffer_id)
+                .expect("buffer existed at the start of the edit");
+            Some(entry.buffer.version()) != pre
+        };
+        if !changed {
+            self.tx_manager.discard(tx_id)?;
+            return Ok(false);
+        }
+        {
+            let entry = self
+                .buffers
+                .get(&buffer_id)
+                .expect("buffer existed at the start of the edit");
+            self.tx_manager.commit(tx_id, &entry.buffer)?;
+        }
+        self.refresh_syntax(buffer_id);
+        self.notify_lsp_changed(buffer_id);
+        Ok(true)
+    }
+
+    /// Persist a buffer to disk (TUI `Ctrl-S` / autosave). The caller
+    /// owns refreshing git status — `App` keeps that TUI-local.
+    #[allow(dead_code)] // consumed by the TUI in Phase 4 step 1b (App-on-core flip).
+    pub fn tui_save(&mut self, buffer_id: u64) -> Result<usize> {
+        let entry = self
+            .buffers
+            .get_mut(&buffer_id)
+            .ok_or_else(|| anyhow!("unknown buffer_id {}", buffer_id))?;
+        entry.buffer.save()
+    }
+
     // ---------- Internals ----------
 
     fn buffer_entry(&self, buffer_id: u64) -> Result<&BufferEntry> {
@@ -1208,5 +1363,110 @@ impl EditorCore {
             )
         })?;
         Ok((lsp, uri))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::SOLE_BUFFER_ID;
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("dyad-core-{}-{}.txt", std::process::id(), name))
+    }
+
+    fn core_with(name: &str, contents: &str) -> (EditorCore, PathBuf) {
+        let path = temp_path(name);
+        std::fs::write(&path, contents).unwrap();
+        let core = EditorCore::open(path.clone()).unwrap();
+        (core, path)
+    }
+
+    #[test]
+    fn open_focuses_sole_buffer() {
+        let (core, path) = core_with("focus", "hello\nworld\n");
+        assert_eq!(core.focus(), Some(SOLE_BUFFER_ID));
+        let meta = core.buffer_meta(SOLE_BUFFER_ID).unwrap();
+        // "hello\nworld\n" => three rope lines (the trailing empty one).
+        assert_eq!(meta.line_count, 3);
+        assert!(!meta.dirty);
+        assert_eq!(meta.version, 0);
+        assert_eq!(meta.path.as_deref(), Some(path.as_path()));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn render_lines_strips_newline_and_pads_past_eof() {
+        let (core, path) = core_with("render", "ab\ncd\n");
+        let lines = core.render_lines(SOLE_BUFFER_ID, 0, 4).unwrap();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0].text, "ab");
+        assert_eq!(lines[1].text, "cd");
+        assert_eq!(lines[2].text, ""); // real trailing empty rope line
+        assert_eq!(lines[3].text, ""); // padded past end-of-buffer
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn render_lines_honors_top_line_offset() {
+        let (core, path) = core_with("offset", "l0\nl1\nl2\nl3\n");
+        let lines = core.render_lines(SOLE_BUFFER_ID, 2, 2).unwrap();
+        assert_eq!(lines[0].text, "l2");
+        assert_eq!(lines[1].text, "l3");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn tui_apply_edit_commits_real_change_and_discards_noop() {
+        let (mut core, path) = core_with("edit", "x\n");
+        let changed = core
+            .tui_apply_edit(SOLE_BUFFER_ID, "insert".into(), |b| b.insert_char(0, 'Z'))
+            .unwrap();
+        assert!(changed);
+        assert!(
+            core.buffer_ref(SOLE_BUFFER_ID)
+                .unwrap()
+                .rope()
+                .to_string()
+                .starts_with("Zx")
+        );
+        assert_eq!(core.history_recent(10).len(), 1);
+
+        // A closure that doesn't touch the rope must roll back without
+        // recording a history entry.
+        let again = core
+            .tui_apply_edit(SOLE_BUFFER_ID, "noop".into(), |_b| {})
+            .unwrap();
+        assert!(!again);
+        assert_eq!(
+            core.history_recent(10).len(),
+            1,
+            "a no-op edit must not record flat history"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn tui_save_persists_and_clears_dirty() {
+        let (mut core, path) = core_with("save", "a\n");
+        core.tui_apply_edit(SOLE_BUFFER_ID, "insert".into(), |b| b.insert_char(0, 'q'))
+            .unwrap();
+        assert!(core.buffer_meta(SOLE_BUFFER_ID).unwrap().dirty);
+        let bytes = core.tui_save(SOLE_BUFFER_ID).unwrap();
+        assert!(bytes > 0);
+        assert!(!core.buffer_meta(SOLE_BUFFER_ID).unwrap().dirty);
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with("qa"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn lens_rejects_unknown_buffer_id() {
+        let (mut core, path) = core_with("unknown", "z\n");
+        assert!(core.buffer_meta(999).is_err());
+        assert!(core.render_lines(999, 0, 1).is_err());
+        assert!(core.buffer_ref(999).is_err());
+        assert!(core.tui_save(999).is_err());
+        assert!(core.tui_apply_edit(999, "x".into(), |_b| {}).is_err());
+        std::fs::remove_file(&path).ok();
     }
 }
