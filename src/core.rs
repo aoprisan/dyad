@@ -5,7 +5,7 @@
 //! `TxManager`, the per-language `LspClient`s, the proposal queue, and
 //! the last test results. This is the single owner that both the TUI
 //! (`App`) and the agent surface (`ProtocolState`) are meant to become
-//! *views* over — the daemon split from `PLAN.md` Phase 4.
+//! *views* over — the daemon split tracked in `ROADMAP.md` (Phase 4).
 //!
 //! It's wrapped in `Arc<Mutex<…>>` by its holders. Today exactly one
 //! client drives a given core at a time (an MCP session *or* the TUI),
@@ -813,7 +813,7 @@ impl EditorCore {
     /// symbols (`siblings`). Enclosing + siblings come from LSP
     /// `documentSymbol` (so this needs a running server); imports are
     /// the LSP-free `scope_imports`. `locals` is deferred (see
-    /// `PLAN.md`).
+    /// `ROADMAP.md`).
     pub fn scope_in_scope(
         &self,
         buffer_id: u64,
@@ -877,7 +877,7 @@ impl EditorCore {
     /// Token cost is the cheap `chars / 4` heuristic, surfaced per slice
     /// and in total so the agent can recalibrate. The richer rungs from
     /// the design (referenced type defs, callee signatures, docstrings —
-    /// all LSP-backed) are deferred to v1; see `PLAN.md` Phase 3.
+    /// all LSP-backed) are deferred to v1; see `ROADMAP.md`.
     pub fn context_pack(
         &self,
         buffer_id: u64,

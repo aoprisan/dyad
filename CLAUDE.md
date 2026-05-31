@@ -83,7 +83,7 @@ the "symmetric clients" invariant from `DESIGN.md`.
   queue, last test results) plus all the editing/query logic. Lives behind
   `Arc<Mutex<…>>` so it can be the single owner both the TUI (`App`) and the
   agent surface (`ProtocolState`) become *views* over — the Phase 4 daemon
-  split (`PLAN.md`). Today exactly one client drives a given core at a time;
+  split (`ROADMAP.md`). Today exactly one client drives a given core at a time;
   `focus`/`explicit_tx` ride along here until real multi-client lands. **App
   does not yet share this core** — that's the next step of Phase 4.
 - `protocol.rs` — `ProtocolState`: the agent-facing *view* over an

@@ -242,7 +242,7 @@ Known scope limits in this iteration:
   response shapes. It therefore needs a running server, while
   `scope.imports` does not. `locals` (params / `let` bindings via a
   Tree-sitter scope walk) is the deferred piece — imports + enclosing +
-  siblings ship first (see `PLAN.md` Phase 2).
+  siblings ship first (see `ROADMAP.md`).
 - `context.pack(buffer, position, token_budget)` bundles source context
   around a point under a token budget. v0 is a deterministic,
   priority-ordered greedy packer — **no scoring model** — and is
@@ -258,7 +258,7 @@ Known scope limits in this iteration:
   feature ultimately wants — referenced type definitions
   (`symbol.definition`), callee signatures (`symbol.hover`), and the
   enclosing item's docstring, all LSP-backed — are deferred to v1 (see
-  `PLAN.md` Phase 3); the greedy packer is the stable core they'll slot
+  `ROADMAP.md`); the greedy packer is the stable core they'll slot
   into as additional priority tiers.
 - Phase 10 ships the protocol surface for proposals
   (`edit.propose_range`, `proposals.list`, `proposals.accept`,
